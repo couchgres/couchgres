@@ -3,7 +3,6 @@ package httpapi
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -260,9 +259,9 @@ func (s *Server) attachmentPutImpl(w http.ResponseWriter, r *http.Request, dbNam
 		return couch.BadRequest(
 			"Attachment name '" + name + "' starts with prohibited character '_'")
 	}
-	data, err := io.ReadAll(r.Body)
+	data, err := readHTTPBody(r)
 	if err != nil {
-		return couch.BadRequest("could not read attachment body")
+		return err
 	}
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {

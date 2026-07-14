@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 
 	"github.com/couchgres/couchgres/internal/couch"
@@ -96,7 +95,11 @@ func (s *Server) localDocs(w http.ResponseWriter, r *http.Request) error {
 	// body twin (probed CouchDB precedence for _local_docs).
 	var body map[string]any
 	if r.Method == "POST" {
-		if raw, err := io.ReadAll(r.Body); err == nil && len(raw) > 0 {
+		raw, err := readHTTPBody(r)
+		if err != nil {
+			return err
+		}
+		if len(raw) > 0 {
 			if v, err := couch.DecodeJSON(raw); err == nil {
 				body, _ = v.(map[string]any)
 			}

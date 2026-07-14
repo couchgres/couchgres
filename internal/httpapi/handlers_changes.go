@@ -3,7 +3,6 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,9 +17,9 @@ func (s *Server) changesGet(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (s *Server) changesPost(w http.ResponseWriter, r *http.Request) error {
-	raw, err := io.ReadAll(r.Body)
+	raw, err := readHTTPBody(r)
 	if err != nil {
-		return couch.BadRequest("could not read request body")
+		return err
 	}
 	// An empty body is fine (all options in the query string).
 	if len(bytes.TrimSpace(raw)) == 0 {

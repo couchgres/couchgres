@@ -117,7 +117,7 @@ func readDocMultipart(body io.Reader, boundary string) (any, []byte, map[string]
 	// normalize the terminator.
 	data, err := io.ReadAll(body)
 	if err != nil {
-		return nil, nil, nil, couch.BadRequest("could not read request body")
+		return nil, nil, nil, mapBodyReadErr(err, "could not read request body")
 	}
 	if i := bytes.LastIndex(data, []byte("\r\n--"+boundary+"--")); i >= 0 {
 		data = append(data[:i], []byte("\r\n--"+boundary+"--\r\n")...)

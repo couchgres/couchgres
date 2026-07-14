@@ -1045,7 +1045,7 @@ func (s *Server) formDataUpdate(w http.ResponseWriter, r *http.Request, dbName, 
 		return err
 	}
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		return couch.BadRequest("invalid multipart/form-data body")
+		return mapBodyReadErr(err, "invalid multipart/form-data body")
 	}
 	revStr := r.FormValue("_rev")
 	rev, err := couch.ParseRev(revStr)

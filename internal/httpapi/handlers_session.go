@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -79,9 +78,9 @@ func (s *Server) sessionDelete(w http.ResponseWriter, r *http.Request) error {
 func sessionCredentials(r *http.Request) (string, string, error) {
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "application/x-www-form-urlencoded") {
-		data, err := io.ReadAll(r.Body)
+		data, err := readHTTPBody(r)
 		if err != nil {
-			return "", "", couch.BadRequest("could not read request body")
+			return "", "", err
 		}
 		form, err := url.ParseQuery(string(data))
 		if err != nil {

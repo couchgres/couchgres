@@ -251,7 +251,10 @@ func (s *Server) showHandler(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(http.StatusNotModified)
 		return nil
 	}
-	body, _ := io.ReadAll(r.Body)
+	body, err := readHTTPBody(r)
+	if err != nil {
+		return err
+	}
 	reqRaw, err := s.jsRequestJSON(r, db, docid, body)
 	if err != nil {
 		return err
@@ -305,7 +308,10 @@ func (s *Server) updateHandler(w http.ResponseWriter, r *http.Request) error {
 			existingRev = &rev
 		}
 	}
-	body, _ := io.ReadAll(r.Body)
+	body, err := readHTTPBody(r)
+	if err != nil {
+		return err
+	}
 	reqRaw, err := s.jsRequestJSON(r, db, docid, body)
 	if err != nil {
 		return err
@@ -407,7 +413,10 @@ func (s *Server) listHandler(w http.ResponseWriter, r *http.Request) error {
 	var body map[string]any
 	var rawBody []byte
 	if r.Method == "POST" {
-		rawBody, _ = io.ReadAll(r.Body)
+		rawBody, err = readHTTPBody(r)
+		if err != nil {
+			return err
+		}
 		if len(rawBody) > 0 {
 			if v, err := couch.DecodeJSON(rawBody); err == nil {
 				body, _ = v.(map[string]any)
@@ -546,7 +555,10 @@ func (s *Server) rewriteHandler(w http.ResponseWriter, r *http.Request) error {
 
 	// The body is needed twice. Rewriters read it, and the re-dispatched
 	// request carries it on (unless the rewriter supplies its own).
-	bodyBytes, _ := io.ReadAll(r.Body)
+	bodyBytes, err := readHTTPBody(r)
+	if err != nil {
+		return err
+	}
 
 	var rewrite *rewriteResult
 	switch rules := ddoc.Body["rewrites"].(type) {

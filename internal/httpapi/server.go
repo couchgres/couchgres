@@ -256,11 +256,15 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 	// patterns can't express next to /{db} routes. Branch before the mux.
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.decodePlusToSpace(r)
-		// chttpd/max_http_request_size (default 4 GiB).
-		if maxSize := int64(s.config.getInt("chttpd", "max_http_request_size", 4294967296)); r.ContentLength > maxSize {
+		// chttpd/max_http_request_size (default 4 GiB). Enforce on the
+		// actual body bytes. Content-Length alone is bypassable via
+		// chunked transfer or an understated/missing length.
+		maxSize := int64(s.config.getInt("chttpd", "max_http_request_size", 4294967296))
+		if r.ContentLength > maxSize {
 			writeError(w, couch.NewError(413, "too_large", "the request entity is too large"))
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxSize)
 		// X-HTTP-Method-Override lets broken clients fake PUT/DELETE
 		// through POST (never any other original method).
 		if r.Method == http.MethodPost {

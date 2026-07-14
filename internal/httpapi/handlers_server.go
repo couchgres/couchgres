@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -247,13 +248,31 @@ func readJSONBody(r *http.Request) (any, error) {
 	return body, err
 }
 
+// readHTTPBody reads the request body, mapping an http.MaxBytesError
+// (from the root MaxBytesReader) to CouchDB's 413 too_large.
+func readHTTPBody(r *http.Request) ([]byte, error) {
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, mapBodyReadErr(err, "could not read request body")
+	}
+	return data, nil
+}
+
+func mapBodyReadErr(err error, fallback string) error {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return couch.NewError(413, "too_large", "the request entity is too large")
+	}
+	return couch.BadRequest(fallback)
+}
+
 // readRawJSONBody also hands back the undecoded bytes: document writes hash
 // the body in its original member order (CouchDB's rev algorithm), which the
 // decoded map has lost.
 func readRawJSONBody(r *http.Request) (any, []byte, error) {
-	data, err := io.ReadAll(r.Body)
+	data, err := readHTTPBody(r)
 	if err != nil {
-		return nil, nil, couch.BadRequest("could not read request body")
+		return nil, nil, err
 	}
 	body, err := couch.DecodeJSON(data)
 	return body, data, err
