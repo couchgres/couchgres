@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Install PostgreSQL 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -p -y
+          sudo apt-get install -y postgresql-17
+          # The runner image ships an older cluster on 5432; replace it with 17.
+          for v in 14 15 16 17; do sudo pg_dropcluster --stop $v main 2>/dev/null || true; done
+          sudo pg_createcluster 17 main --port 5432 -- --auth-local trust --auth-host trust
+          sudo systemctl start postgresql@17-main
+          sudo -u postgres createuser --superuser "$USER"
+          createdb couchgres_test
+          createdb couchgres
+
+      - name: Install CouchDB 3.5
+        run: |
+          curl -fsSL https://couchdb.apache.org/repo/keys.asc \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/couchdb-archive-keyring.gpg > /dev/null
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/keyrings/couchdb-archive-keyring.gpg] https://apache.jfrog.io/artifactory/couchdb-deb/ ${VERSION_CODENAME} main" \
+            | sudo tee /etc/apt/sources.list.d/couchdb.list
+          sudo apt-get update
+          sudo debconf-set-selections <<'EOF'
+          couchdb couchdb/mode select standalone
+          couchdb couchdb/bindaddress string 127.0.0.1
+          couchdb couchdb/cookie string couchgres-ci
+          couchdb couchdb/adminpass password secret
+          couchdb couchdb/adminpass_again password secret
+          EOF
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y couchdb
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:5984/_up && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:5984/
+
+      - name: Fetch Fauxton
+        run: make fauxton
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
+
+      - name: Tests (unit + Postgres integration + live CouchDB checks, race detector)
+        # COUCHGRES_LIVE_COUCH turns on tests against a real CouchDB:
+        # collation (509 keys sorted by internal/collate vs a real view)
+        # and rev hashing (every rev a real CouchDB mints must match
+        # couch.NewRevID byte for byte — there is no spec for the hash).
+        run: COUCHGRES_LIVE_COUCH=http://admin:secret@127.0.0.1:5984 go test -race ./...
+
+      - name: Start couchgres
+        run: |
+          go build -o /tmp/couchgres ./cmd/couchgres
+          cat > /tmp/couchgres-ci.yaml <<'EOF'
+          bind: 127.0.0.1
+          port: 5987
+          postgres:
+            url: postgres://localhost/couchgres
+            pool_size: 16
+          admins:
+            admin: secret
+          log: info
+          EOF
+          /tmp/couchgres /tmp/couchgres-ci.yaml &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:5987/_up && break
+            sleep 1
+          done
+
+      - name: Compatibility checks (differential vs CouchDB 3.5)
+        # No credentials in COUCH_URL: anonymous cases must really be
+        # anonymous; cases carry their own Authorization headers.
+        run: |
+          COUCH_URL=http://127.0.0.1:5984 \
+          COUCHGRES_URL=http://127.0.0.1:5987 go run ./compat
+
+      - name: Replication check against CouchDB (4 directions)
+        run: |
+          COUCH=http://admin:secret@127.0.0.1:5984 \
+          CG=http://admin:secret@127.0.0.1:5987 compat/replication-check.sh
+
+      - name: Client compatibility (nano, PouchDB sync, couchdb-python)
+        run: |
+          COUCHGRES_URL=http://admin:secret@127.0.0.1:5987 compat/clients/run.sh
+
+      - name: View build throughput (informational)
+        # Catches regressions in batched Go/JS view builds: a per-doc crossing
+        # would collapse docs/sec by an order of magnitude.
+        run: go test ./internal/httpapi -bench BenchmarkView -benchtime 5x -run xxx
