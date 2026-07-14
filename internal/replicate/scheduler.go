@@ -11,8 +11,8 @@ import (
 	"github.com/couchgres/couchgres/internal/store"
 )
 
-// Scheduler owns running replication jobs: transient ones from
-// POST /_replicate and persistent ones from _replicator documents.
+// Tracks running replication jobs from POST /_replicate and from
+// _replicator documents.
 type Scheduler struct {
 	store  *store.Store
 	broker *store.Broker
@@ -141,8 +141,18 @@ func (s *Scheduler) Launch(ctx context.Context, o Options, docID string) (*Job, 
 		default:
 			job.setState("completed", nil, result)
 		}
+		s.prune(job)
 	}()
 	return job, true, nil
+}
+
+// prune removes a finished job from the map if it is still the current entry.
+func (s *Scheduler) prune(job *Job) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.jobs[job.ID]; ok && cur == job {
+		delete(s.jobs, job.ID)
+	}
 }
 
 // Wait blocks until the job finishes (one-shot _replicate responses).
@@ -166,7 +176,7 @@ func (s *Scheduler) Cancel(o Options) (*Job, bool) {
 	return job, true
 }
 
-// Jobs snapshots every known job, running first, newest first within state.
+// Jobs returns the jobs still tracked by the scheduler.
 func (s *Scheduler) Jobs() []*Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
