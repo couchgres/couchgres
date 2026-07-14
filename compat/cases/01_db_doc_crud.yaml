@@ -1,0 +1,120 @@
+# Database + document CRUD lifecycle. Cases are order-dependent within a file.
+cases:
+  - name: create-db
+    method: PUT
+    path: /compat_crud
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: create-db-conflict
+    method: PUT
+    path: /compat_crud
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 412
+
+  - name: open-security
+    method: PUT
+    path: /compat_crud/_security
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 200
+
+  - name: anonymous-blocked-before-open
+    method: GET
+    path: /compat_crud
+    expect_status: 200
+
+  - name: db-info
+    method: GET
+    path: /compat_crud
+    expect_status: 200
+
+  - name: put-doc
+    method: PUT
+    path: /compat_crud/doc1
+    body: { "title": "one", "n": 1 }
+    expect_status: 201
+
+  - name: get-doc
+    method: GET
+    path: /compat_crud/doc1
+    expect_status: 200
+
+  - name: put-doc-conflict-no-rev
+    method: PUT
+    path: /compat_crud/doc1
+    body: { "title": "clobber" }
+    expect_status: 409
+
+  - name: put-doc-conflict-bad-rev
+    method: PUT
+    path: /compat_crud/doc1?rev=1-00000000000000000000000000000000
+    body: { "title": "clobber" }
+    expect_status: 409
+
+  - name: delete-doc-no-rev
+    method: DELETE
+    path: /compat_crud/doc1
+    expect_status: 409
+
+  - name: doc-missing
+    method: GET
+    path: /compat_crud/absent
+    expect_status: 404
+
+  - name: post-doc-autoid
+    method: POST
+    path: /compat_crud
+    body: { "auto": true }
+    expect_status: 201
+    skip_diff: true # generated ids differ
+
+  - name: reserved-docid
+    method: PUT
+    path: /compat_crud/_reserved
+    body: { "x": 1 }
+    expect_status: 400
+
+  - name: bad-special-member
+    method: PUT
+    path: /compat_crud/badmember
+    body: { "_zing": 1 }
+    expect_status: 400
+
+  - name: all-docs
+    method: GET
+    path: /compat_crud/_all_docs
+    expect_status: 200
+    skip_diff: true # includes generated autoid
+
+  - name: all-docs-range
+    method: GET
+    path: /compat_crud/_all_docs?startkey=%22doc%22&endkey=%22doc%C3%BF%22
+    # The lingering autoid doc sorts before or after this range depending
+    # on its first hex digit, so the offset is luck on both servers.
+    ignore: [offset]
+    expect_status: 200
+
+  - name: revs-limit-get
+    method: GET
+    path: /compat_crud/_revs_limit
+    expect_status: 200
+
+  - name: revs-limit-put
+    method: PUT
+    path: /compat_crud/_revs_limit
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: 500
+    expect_status: 200
+
+  - name: delete-db
+    method: DELETE
+    path: /compat_crud
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  - name: delete-db-missing
+    method: DELETE
+    path: /compat_crud
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 404

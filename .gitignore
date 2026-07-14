@@ -1,0 +1,7 @@
+.DS_Store
+*.log
+couchgres.yaml
+!couchgres.example.yaml
+couchgres
+internal/fauxton/dist/
+internal/fauxton/LICENSE

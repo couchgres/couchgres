@@ -1,0 +1,289 @@
+# Views, validate_doc_update, and JS changes filters, checked differentially
+# against a real CouchDB. Cases are order-dependent within this file.
+cases:
+  - name: views-create-db
+    method: PUT
+    path: /compat_views
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: views-open-security
+    method: PUT
+    path: /compat_views/_security
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 200
+
+# The n docs are written one at a time so both servers see the same
+  # _changes order (bulk writes land in nondeterministic order in CouchDB).
+  - name: views-seed-n1
+    method: PUT
+    path: /compat_views/n1
+    body: { kind: "n", n: 1, tag: "odd" }
+    expect_status: 201
+  - name: views-seed-n2
+    method: PUT
+    path: /compat_views/n2
+    body: { kind: "n", n: 2, tag: "even" }
+    expect_status: 201
+  - name: views-seed-n3
+    method: PUT
+    path: /compat_views/n3
+    body: { kind: "n", n: 3, tag: "odd" }
+    expect_status: 201
+  - name: views-seed-n4
+    method: PUT
+    path: /compat_views/n4
+    body: { kind: "n", n: 4, tag: "even" }
+    expect_status: 201
+  - name: views-seed-n5
+    method: PUT
+    path: /compat_views/n5
+    body: { kind: "n", n: 5, tag: "odd" }
+    expect_status: 201
+
+  - name: views-seed-docs
+    method: POST
+    path: /compat_views/_bulk_docs
+    body:
+      docs:
+        - { _id: "k-null", k: null }
+        - { _id: "k-false", k: false }
+        - { _id: "k-true", k: true }
+        - { _id: "k-num2", k: 2 }
+        - { _id: "k-num10", k: 10 }
+        - { _id: "k-neg", k: -1.5 }
+        - { _id: "k-stra", k: "apple" }
+        - { _id: "k-strA", k: "Apple" }
+        - { _id: "k-strb", k: "banana" }
+        - { _id: "k-arr", k: ["a", 1] }
+        - { _id: "k-arr2", k: ["a"] }
+        - { _id: "k-obj", k: { o: 1 } }
+        - { _id: "linked", ref: "n1" }
+    expect_status: 201
+
+  - name: views-put-ddoc
+    method: PUT
+    path: /compat_views/_design/vt
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body:
+      views:
+        byn:
+          map: "function(doc){ if(doc.kind==='n') emit(doc.n, doc.n*10); }"
+        byk:
+          map: "function(doc){ if('k' in doc) emit(doc.k, null); }"
+        sum:
+          map: "function(doc){ if(doc.kind==='n') emit(doc.tag, doc.n); }"
+          reduce: "function(keys, values, rereduce){ return sum(values); }"
+        stats:
+          map: "function(doc){ if(doc.kind==='n') emit([doc.tag, doc.n], doc.n); }"
+          reduce: "_stats"
+        count:
+          map: "function(doc){ if(doc.kind==='n') emit(doc.tag, null); }"
+          reduce: "_count"
+        links:
+          map: "function(doc){ if(doc.ref) emit(doc._id, {_id: doc.ref}); }"
+      filters:
+        bytag: "function(doc, req){ return doc.tag === req.query.tag; }"
+    expect_status: 201
+
+  - name: view-basic
+    method: GET
+    path: /compat_views/_design/vt/_view/byn
+    expect_status: 200
+
+  - name: view-collation-order
+    method: GET
+    path: /compat_views/_design/vt/_view/byk
+    expect_status: 200
+
+  - name: view-range
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?startkey=2&endkey=4
+    expect_status: 200
+
+  - name: view-range-exclusive
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?startkey=2&endkey=4&inclusive_end=false
+    expect_status: 200
+
+  - name: view-descending
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?descending=true&limit=2
+    expect_status: 200
+
+  - name: view-skip-limit
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?skip=1&limit=2
+    expect_status: 200
+
+  - name: view-key
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?key=3
+    expect_status: 200
+
+  - name: view-string-range
+    method: GET
+    path: /compat_views/_design/vt/_view/byk?startkey=%22apple%22
+    expect_status: 200
+
+  - name: view-keys-post
+    method: POST
+    path: /compat_views/_design/vt/_view/byn
+    body: { keys: [5, 1, 99] }
+    # Multi-key offsets are shard-merge noise in clustered CouchDB.
+    ignore: [offset]
+    expect_status: 200
+
+  - name: view-include-docs
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?include_docs=true&limit=2
+    expect_status: 200
+
+  - name: view-linked-docs
+    method: GET
+    path: /compat_views/_design/vt/_view/links?include_docs=true
+    expect_status: 200
+
+  - name: view-reduce-whole
+    method: GET
+    path: /compat_views/_design/vt/_view/sum
+    expect_status: 200
+
+  - name: view-reduce-group
+    method: GET
+    path: /compat_views/_design/vt/_view/sum?group=true
+    expect_status: 200
+
+  - name: view-reduce-false
+    method: GET
+    path: /compat_views/_design/vt/_view/sum?reduce=false
+    expect_status: 200
+
+  - name: view-count-group
+    method: GET
+    path: /compat_views/_design/vt/_view/count?group=true
+    expect_status: 200
+
+  - name: view-stats-group-level
+    method: GET
+    path: /compat_views/_design/vt/_view/stats?group_level=1
+    expect_status: 200
+
+  - name: view-stats-whole
+    method: GET
+    path: /compat_views/_design/vt/_view/stats
+    expect_status: 200
+
+  - name: view-reduce-on-map-only
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?reduce=true
+    expect_status: 400
+
+  - name: view-group-on-map-only
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?group=true
+    expect_status: 400
+
+  - name: view-missing-view
+    method: GET
+    path: /compat_views/_design/vt/_view/nope
+    expect_status: 404
+
+  - name: view-missing-ddoc
+    method: GET
+    path: /compat_views/_design/nope/_view/x
+    expect_status: 404
+
+  - name: view-bad-startkey
+    method: GET
+    path: /compat_views/_design/vt/_view/byn?startkey=notjson
+    expect_status: 400
+
+  - name: view-queries
+    method: POST
+    path: /compat_views/_design/vt/_view/byn/queries
+    body:
+      queries:
+        - { key: 1 }
+        - { startkey: 3, descending: false }
+    expect_status: 200
+
+  - name: design-docs-list
+    method: GET
+    path: /compat_views/_design_docs
+    expect_status: 200
+
+  - name: view-cleanup
+    method: POST
+    path: /compat_views/_view_cleanup
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 202
+
+  - name: compact-db
+    method: POST
+    path: /compat_views/_compact
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 202
+
+  - name: compact-view
+    method: POST
+    path: /compat_views/_compact/vt
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 202
+
+  # --- validate_doc_update ---------------------------------------------------
+  - name: vdu-put-ddoc
+    method: PUT
+    path: /compat_views/_design/rules
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body:
+      validate_doc_update: "function(newDoc, oldDoc, userCtx, secObj){ if (newDoc._deleted) return; if (newDoc.kind || newDoc.k || newDoc.ref || newDoc.views) return; if (!newDoc.author) throw({forbidden: 'documents need an author'}); if (newDoc.secret) throw({unauthorized: 'no secrets'}); }"
+    expect_status: 201
+
+  - name: vdu-forbidden
+    method: PUT
+    path: /compat_views/vdu-no-author
+    body: { x: 1 }
+    expect_status: 403
+
+  - name: vdu-unauthorized
+    method: PUT
+    path: /compat_views/vdu-secret
+    body: { author: "a", secret: true }
+    expect_status: 401
+
+  - name: vdu-allowed
+    method: PUT
+    path: /compat_views/vdu-ok
+    body: { author: "rob" }
+    expect_status: 201
+
+  # --- JS changes filters ----------------------------------------------------
+  - name: changes-js-filter
+    method: GET
+    path: /compat_views/_changes?filter=vt/bytag&tag=odd
+    expect_status: 200
+
+  - name: changes-view-filter
+    method: GET
+    path: /compat_views/_changes?filter=_view&view=vt/byn
+    expect_status: 200
+
+  - name: changes-missing-filter
+    method: GET
+    path: /compat_views/_changes?filter=vt/nope
+    expect_status: 404
+
+  - name: changes-bad-filter-format
+    method: GET
+    path: /compat_views/_changes?filter=justoneword
+    expect_status: 400
+
+  - name: views-cleanup-db
+    method: DELETE
+    path: /compat_views
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200

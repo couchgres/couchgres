@@ -1,0 +1,311 @@
+cases:
+  # --- purge -------------------------------------------------------------------
+  - name: purge-create-db
+    method: PUT
+    path: /compat_purge
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: purge-seed
+    method: PUT
+    path: /compat_purge/gone
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: { v: 1 }
+    expect_status: 201
+
+  # The rev to purge differs per server, so the purge itself is exercised by
+  # the sole-leaf case via a fresh doc with a deterministic... revs differ;
+  # compare only the unknown-rev/no-doc shapes exactly.
+  - name: purge-unknown-rev
+    method: POST
+    path: /compat_purge/_purge
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: { gone: ["1-00000000000000000000000000000000"] }
+    expect_status: 201
+
+  - name: purge-missing-doc
+    method: POST
+    path: /compat_purge/_purge
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: { nope: ["1-00000000000000000000000000000000"] }
+    expect_status: 201
+
+  - name: purged-infos-limit-get
+    method: GET
+    path: /compat_purge/_purged_infos_limit
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  - name: purged-infos-limit-put
+    method: PUT
+    path: /compat_purge/_purged_infos_limit
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: 500
+    expect_status: 200
+
+  - name: purge-cleanup
+    method: DELETE
+    path: /compat_purge
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  # --- partitioned databases ------------------------------------------------------
+  - name: part-create-db
+    method: PUT
+    path: /compat_part?partitioned=true
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: part-open-security
+    method: PUT
+    path: /compat_part/_security
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 200
+
+  - name: part-bad-docid
+    method: PUT
+    path: /compat_part/noprefix
+    body: { v: 1 }
+    expect_status: 400
+
+  - name: part-seed-p1a
+    method: PUT
+    path: /compat_part/p1:a
+    body: { n: 1 }
+    expect_status: 201
+  - name: part-seed-p1b
+    method: PUT
+    path: /compat_part/p1:b
+    body: { n: 2 }
+    expect_status: 201
+  - name: part-seed-p2a
+    method: PUT
+    path: /compat_part/p2:a
+    body: { n: 3 }
+    expect_status: 201
+
+  - name: part-ddoc
+    method: PUT
+    path: /compat_part/_design/pv
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body:
+      views: { byn: { map: "function(d){ if(d.n) emit(d.n, null); }" } }
+    expect_status: 201
+
+  - name: part-db-info-props
+    method: GET
+    path: /compat_part
+    expect_status: 200
+
+  - name: part-info
+    method: GET
+    path: /compat_part/_partition/p1
+    expect_status: 200
+
+  - name: part-all-docs
+    method: GET
+    path: /compat_part/_partition/p1/_all_docs
+    expect_status: 200
+
+  - name: part-view
+    method: GET
+    path: /compat_part/_partition/p1/_design/pv/_view/byn
+    expect_status: 200
+
+  - name: part-view-global-rejected
+    method: GET
+    path: /compat_part/_design/pv/_view/byn
+    expect_status: 400
+
+  - name: part-find
+    method: POST
+    path: /compat_part/_partition/p1/_find
+    body: { selector: { n: { $gte: 0 } } }
+    expect_status: 200
+
+  - name: part-cleanup
+    method: DELETE
+    path: /compat_part
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  # --- the ddoc zoo -----------------------------------------------------------------
+  - name: zoo-create-db
+    method: PUT
+    path: /compat_zoo
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: zoo-open-security
+    method: PUT
+    path: /compat_zoo/_security
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 200
+
+  - name: zoo-seed-d1
+    method: PUT
+    path: /compat_zoo/d1
+    body: { name: "alice", n: 1 }
+    expect_status: 201
+  - name: zoo-seed-d2
+    method: PUT
+    path: /compat_zoo/d2
+    body: { name: "bob", n: 2 }
+    expect_status: 201
+
+  - name: zoo-ddoc
+    method: PUT
+    path: /compat_zoo/_design/z
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body:
+      views: { byn: { map: "function(d){ if(d.n) emit(d.n, d.name); }" } }
+      shows:
+        hello: "function(doc, req){ if(!doc) return {code:404, body:'no doc'}; return {body:'Hello ' + doc.name, headers:{'Content-Type':'text/html'}}; }"
+        asjson: "function(doc, req){ return {json:{id:doc._id, q:req.query.x}}; }"
+      updates:
+        bump: "function(doc, req){ if(!doc) return [null, 'nodoc']; doc.n = doc.n + 1; return [doc, 'bumped to ' + doc.n]; }"
+      lists:
+        csv: "function(head, req){ start({headers:{'Content-Type':'text/plain'}}); send('total:' + head.total_rows + '\\n'); var row; while(row = getRow()){ send(row.key + ',' + row.value + '\\n'); } return 'done'; }"
+      rewrites:
+        - { from: "/greet/:doc", to: "_show/hello/:doc" }
+        - { from: "/first", to: "_view/byn", query: { limit: "1" } }
+    expect_status: 201
+
+  - name: show-doc
+    method: GET
+    path: /compat_zoo/_design/z/_show/hello/d1
+    expect_status: 200
+
+  - name: show-missing-doc
+    method: GET
+    path: /compat_zoo/_design/z/_show/hello/ghost
+    expect_status: 404
+
+  - name: show-json
+    method: GET
+    path: /compat_zoo/_design/z/_show/asjson/d1?x=42
+    expect_status: 200
+
+  - name: show-missing-fn
+    method: GET
+    path: /compat_zoo/_design/z/_show/nope/d1
+    expect_status: 404
+
+  - name: update-doc
+    method: POST
+    path: /compat_zoo/_design/z/_update/bump/d1
+    expect_status: 201
+
+  - name: update-null-doc
+    method: POST
+    path: /compat_zoo/_design/z/_update/bump/ghost
+    expect_status: 200
+
+  - name: list-view
+    method: GET
+    path: /compat_zoo/_design/z/_list/csv/byn
+    expect_status: 200
+
+  - name: list-view-params
+    method: GET
+    path: /compat_zoo/_design/z/_list/csv/byn?descending=true&limit=1
+    expect_status: 200
+
+  - name: rewrite-show
+    method: GET
+    path: /compat_zoo/_design/z/_rewrite/greet/d2
+    expect_status: 200
+
+  - name: rewrite-view-query
+    method: GET
+    path: /compat_zoo/_design/z/_rewrite/first
+    expect_status: 200
+
+  - name: rewrite-no-rule
+    method: GET
+    path: /compat_zoo/_design/z/_rewrite/nothing/here
+    expect_status: 404
+
+  - name: search-unavailable
+    method: GET
+    path: /compat_zoo/_design/z/_search/idx?q=x
+    expect_status: 503
+
+  - name: zoo-cleanup
+    method: DELETE
+    path: /compat_zoo
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  # --- cluster stubs ---------------------------------------------------------------
+  - name: membership-anonymous
+    method: GET
+    path: /_membership
+    expect_status: 401
+
+  - name: membership
+    method: GET
+    path: /_membership
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    ignore: [all_nodes, cluster_nodes]
+    expect_status: 200
+
+  - name: cluster-setup
+    method: GET
+    path: /_cluster_setup
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  - name: reshard
+    method: GET
+    path: /_reshard
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  - name: shards-create-db
+    method: PUT
+    path: /compat_shards
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: shards
+    method: GET
+    path: /compat_shards/_shards
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    skip_diff: true
+    expect_status: 200
+
+  - name: sync-shards
+    method: POST
+    path: /compat_shards/_sync_shards
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 202
+
+  - name: shards-cleanup
+    method: DELETE
+    path: /compat_shards
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  - name: node-versions
+    method: GET
+    path: /_node/_local/_versions
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    skip_diff: true
+    expect_status: 200
+
+  - name: node-system
+    method: GET
+    path: /_node/_local/_system
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    skip_diff: true
+    expect_status: 200
+
+  - name: node-stats
+    method: GET
+    path: /_node/_local/_stats
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    skip_diff: true
+    expect_status: 200

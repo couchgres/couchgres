@@ -1,0 +1,318 @@
+# Mango: _find / _index / _explain / filter=_selector, checked
+# differentially against a real CouchDB. Cases are order-dependent.
+# Indexes always name their ddoc explicitly so ids match across servers
+# (auto-generated names are digests of server-internal terms).
+cases:
+  - name: mango-create-db
+    method: PUT
+    path: /compat_mango
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: mango-open-security
+    method: PUT
+    path: /compat_mango/_security
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 200
+
+  - name: mango-seed-u1
+    method: PUT
+    path: /compat_mango/u1
+    body: { type: "user", name: "alice", age: 31, tags: ["admin", "dev"] }
+    expect_status: 201
+  - name: mango-seed-u2
+    method: PUT
+    path: /compat_mango/u2
+    body: { type: "user", name: "bob", age: 25, tags: ["dev"] }
+    expect_status: 201
+  - name: mango-seed-u3
+    method: PUT
+    path: /compat_mango/u3
+    body: { type: "user", name: "carol", age: 40 }
+    expect_status: 201
+  - name: mango-seed-p1
+    method: PUT
+    path: /compat_mango/p1
+    body: { type: "post", name: "hello", author: "alice", meta: { b: { c: 7 } } }
+    expect_status: 201
+  - name: mango-seed-p2
+    method: PUT
+    path: /compat_mango/p2
+    body: { type: "post", name: "world", author: "bob" }
+    expect_status: 201
+
+  # --- evaluator through the fallback scan ----------------------------------
+  - name: find-eq
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { type: "user" } }
+    expect_status: 200
+
+  - name: find-array-in
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { tags: { $in: ["admin"] } } }
+    expect_status: 200
+
+  - name: find-eq-no-array-fallback
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { tags: "dev" } }
+    expect_status: 200
+
+  - name: find-range
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { age: { $gt: 25, $lte: 40 } } }
+    expect_status: 200
+
+  - name: find-or
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { $or: [{ name: "bob" }, { name: "carol" }] } }
+    expect_status: 200
+
+  - name: find-dotted-path
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { "meta.b.c": 7 } }
+    expect_status: 200
+
+  - name: find-nested-selector
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { meta: { b: { c: 7 } } } }
+    expect_status: 200
+
+  - name: find-elem-match
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { tags: { $elemMatch: { $eq: "admin" } } } }
+    expect_status: 200
+
+  - name: find-regex
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { name: { $regex: "^b.b$" } } }
+    expect_status: 200
+
+  - name: find-mod
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { age: { $mod: [2, 1] } } }
+    expect_status: 200
+
+  - name: find-exists-false
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { author: { $exists: false }, type: "user" } }
+    expect_status: 200
+
+  - name: find-not
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { age: { $not: { $gt: 30 } } } }
+    expect_status: 200
+
+  - name: find-type-size-all
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { tags: { $type: "array", $size: 2, $all: ["dev"] } } }
+    expect_status: 200
+
+  - name: find-fields-projection
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { _id: "u1" }, fields: ["name", "age"] }
+    expect_status: 200
+
+  - name: find-limit-skip
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { type: { $exists: true } }, limit: 2, skip: 1 }
+    expect_status: 200
+
+  # --- error catalog ----------------------------------------------------------
+  - name: find-missing-selector
+    method: POST
+    path: /compat_mango/_find
+    body: { limit: 5 }
+    expect_status: 400
+
+  - name: find-invalid-operator
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { age: { $bogus: 1 } } }
+    expect_status: 400
+
+  - name: find-selector-not-object
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: 5 }
+    expect_status: 400
+
+  - name: find-mixed-sort
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { age: { $gt: 0 } }, sort: [{ age: "asc" }, { name: "desc" }] }
+    expect_status: 400
+
+  - name: find-sort-no-index
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { age: { $gt: 0 } }, sort: [{ name: "asc" }] }
+    expect_status: 400
+
+  - name: find-bad-mod-arg
+    method: POST
+    path: /compat_mango/_find
+    body: { selector: { age: { $mod: [2.5, 0] } } }
+    expect_status: 400
+
+  # --- indexes ----------------------------------------------------------------
+  - name: index-create
+    method: POST
+    path: /compat_mango/_index
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: { index: { fields: ["type", "age"] }, name: "typeage", ddoc: "mgidx" }
+    expect_status: 200
+
+  - name: index-create-again
+    method: POST
+    path: /compat_mango/_index
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: { index: { fields: ["type", "age"] }, name: "typeage", ddoc: "mgidx" }
+    expect_status: 200
+
+  - name: index-text-unavailable
+    method: POST
+    path: /compat_mango/_index
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: { index: { fields: ["name"] }, type: "text" }
+    expect_status: 503
+
+  - name: index-list
+    method: GET
+    path: /compat_mango/_index
+    expect_status: 200
+
+  - name: find-indexed-sorted
+    method: POST
+    path: /compat_mango/_find
+    body:
+      selector: { type: "user", age: { $gte: 26 } }
+      sort: [{ type: "asc" }, { age: "asc" }]
+    expect_status: 200
+
+  - name: find-indexed-desc
+    method: POST
+    path: /compat_mango/_find
+    body:
+      selector: { type: "user", age: { $gt: 0 } }
+      sort: [{ type: "desc" }, { age: "desc" }]
+    expect_status: 200
+
+  - name: find-execution-stats
+    method: POST
+    path: /compat_mango/_find
+    body:
+      selector: { type: "user", age: { $eq: 31 } }
+      execution_stats: true
+    expect_status: 200
+
+  - name: find-use-index
+    method: POST
+    path: /compat_mango/_find
+    body:
+      selector: { type: "user", age: { $gt: 0 } }
+      use_index: "mgidx"
+    expect_status: 200
+
+  - name: find-use-index-unusable
+    method: POST
+    path: /compat_mango/_find
+    body:
+      selector: { author: "bob" }
+      use_index: "mgidx"
+    expect_status: 200
+
+  - name: explain-indexed
+    method: POST
+    path: /compat_mango/_explain
+    body:
+      selector: { type: "user", age: { $gt: 30 } }
+    ignore: [index_candidates, selector_hints, covering]
+    expect_status: 200
+
+  - name: explain-fallback
+    method: POST
+    path: /compat_mango/_explain
+    body:
+      selector: { author: "bob" }
+    ignore: [index_candidates, selector_hints, covering, mrargs]
+    expect_status: 200
+
+  # --- partial filter selector -------------------------------------------------
+  - name: index-partial-create
+    method: POST
+    path: /compat_mango/_index
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body:
+      index:
+        fields: ["age"]
+        partial_filter_selector: { type: "user" }
+      name: "userage"
+      ddoc: "partialidx"
+    expect_status: 200
+
+  - name: find-partial-index
+    method: POST
+    path: /compat_mango/_find
+    body:
+      selector: { age: { $gt: 0 }, type: "user" }
+      sort: [{ age: "asc" }]
+      use_index: "partialidx"
+    expect_status: 200
+
+  # --- selector changes filter ---------------------------------------------------
+  - name: changes-selector
+    method: POST
+    path: /compat_mango/_changes?filter=_selector
+    body: { selector: { type: "post" } }
+    expect_status: 200
+
+  - name: changes-selector-no-body
+    method: GET
+    path: /compat_mango/_changes?filter=_selector
+    expect_status: 400
+
+  - name: changes-selector-invalid
+    method: POST
+    path: /compat_mango/_changes?filter=_selector
+    body: { selector: { a: { $bogus: 1 } } }
+    expect_status: 400
+
+  # --- index deletion --------------------------------------------------------------
+  - name: index-delete
+    method: DELETE
+    path: /compat_mango/_index/_design/mgidx/json/typeage
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200
+
+  - name: index-delete-missing
+    method: DELETE
+    path: /compat_mango/_index/_design/mgidx/json/typeage
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 404
+
+  - name: index-list-after-delete
+    method: GET
+    path: /compat_mango/_index
+    expect_status: 200
+
+  - name: mango-cleanup-db
+    method: DELETE
+    path: /compat_mango
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200

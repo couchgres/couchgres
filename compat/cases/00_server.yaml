@@ -1,0 +1,63 @@
+# Server-level endpoints. Bodies with version/vendor info are normalized.
+# Both servers must have the admin admin:secret configured.
+cases:
+  - name: welcome
+    method: GET
+    path: /
+    expect_status: 200
+
+  - name: up
+    method: GET
+    path: /_up
+    expect_status: 200
+
+  - name: uuids-default
+    method: GET
+    path: /_uuids
+    expect_status: 200
+    skip_diff: true # uuids differ by construction
+
+  - name: uuids-count-too-large
+    method: GET
+    path: /_uuids?count=1001
+    expect_status: 400
+    skip_diff: true # TODO: verify exact error body against couchdb
+
+  - name: all-dbs-initial
+    method: GET
+    path: /_all_dbs
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" } # admin:secret
+    expect_status: 200
+
+  - name: all-dbs-anonymous-401
+    method: GET
+    path: /_all_dbs
+    expect_status: 401
+
+  - name: missing-db-404
+    method: GET
+    path: /no_such_db
+    expect_status: 404
+
+  - name: illegal-db-name
+    method: PUT
+    path: /9starts_with_digit
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 400
+
+  - name: session-anonymous
+    method: GET
+    path: /_session
+    expect_status: 200
+
+  - name: session-bad-login
+    method: POST
+    path: /_session
+    body: { "name": "admin", "password": "wrong" }
+    expect_status: 401
+
+  - name: session-login
+    method: POST
+    path: /_session
+    body: { "name": "admin", "password": "secret" }
+    expect_status: 200

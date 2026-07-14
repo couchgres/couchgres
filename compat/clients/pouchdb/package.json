@@ -1,0 +1,12 @@
+{
+  "name": "couchgres-client-pouchdb",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pouchdb": "^9.0.0",
+    "pouchdb-adapter-memory": "^9.0.0"
+  },
+  "scripts": {
+    "check": "node sync.js"
+  }
+}

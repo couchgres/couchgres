@@ -1,0 +1,120 @@
+# The replication protocol surface, as a CouchDB replicator drives it.
+cases:
+  - name: rep-create-db
+    method: PUT
+    path: /compat_rep
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 201
+
+  - name: rep-open-security
+    method: PUT
+    path: /compat_rep/_security
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    body: {}
+    expect_status: 200
+
+  - name: rep-checkpoint-missing
+    method: GET
+    path: /compat_rep/_local/checkpoint-x
+    expect_status: 404
+
+  - name: rep-revs-diff-all-missing
+    method: POST
+    path: /compat_rep/_revs_diff
+    body: { "doc1": ["2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] }
+    expect_status: 200
+
+  - name: rep-push-new-edits-false
+    method: POST
+    path: /compat_rep/_bulk_docs
+    body:
+      new_edits: false
+      docs:
+        - _id: doc1
+          _rev: "2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          _revisions:
+            start: 2
+            ids: ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+          v: 1
+    expect_status: 201
+
+  - name: rep-doc-landed-with-history
+    method: GET
+    path: /compat_rep/doc1?revs=true
+    expect_status: 200
+
+  - name: rep-revs-diff-nothing-missing
+    method: POST
+    path: /compat_rep/_revs_diff
+    body: { "doc1": ["2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"] }
+    expect_status: 200
+
+  - name: rep-conflict-branch
+    method: POST
+    path: /compat_rep/_bulk_docs
+    body:
+      new_edits: false
+      docs:
+        - _id: doc1
+          _rev: "2-cccccccccccccccccccccccccccccccc"
+          _revisions:
+            start: 2
+            ids: ["cccccccccccccccccccccccccccccccc", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+          v: 2
+    expect_status: 201
+
+  - name: rep-conflicts-visible
+    method: GET
+    path: /compat_rep/doc1?conflicts=true
+    expect_status: 200
+
+  - name: rep-open-revs-all
+    method: GET
+    path: /compat_rep/doc1?open_revs=all&revs=true
+    headers: { Accept: "application/json" }
+    expect_status: 200
+
+  - name: rep-bulk-get
+    method: POST
+    path: /compat_rep/_bulk_get?revs=true
+    body: { "docs": [{ "id": "doc1" }, { "id": "ghost" }] }
+    expect_status: 200
+    skip_diff: true # winner rev among equal-depth conflicts depends on hashes
+
+  - name: rep-changes-all-docs-style
+    method: GET
+    path: /compat_rep/_changes?style=all_docs
+    expect_status: 200
+
+  - name: rep-ensure-full-commit
+    method: POST
+    path: /compat_rep/_ensure_full_commit
+    body: {}
+    expect_status: 201
+
+  - name: rep-ensure-full-commit-bad-content-type
+    method: POST
+    path: /compat_rep/_ensure_full_commit
+    expect_status: 415
+
+  - name: rep-checkpoint-write
+    method: PUT
+    path: /compat_rep/_local/checkpoint-x
+    body: { "last_seq": "3" }
+    expect_status: 201
+
+  - name: rep-checkpoint-read
+    method: GET
+    path: /compat_rep/_local/checkpoint-x
+    expect_status: 200
+
+  - name: rep-local-absent-from-changes
+    method: GET
+    path: /compat_rep/_changes
+    expect_status: 200
+
+  - name: rep-cleanup
+    method: DELETE
+    path: /compat_rep
+    headers: { Authorization: "Basic YWRtaW46c2VjcmV0" }
+    expect_status: 200

@@ -1,0 +1,19 @@
+# Listener
+bind: 127.0.0.1
+port: 5984
+
+# PostgreSQL Configuration
+postgres:
+  url: postgres://localhost/couchgres
+  pool_size: 16
+
+# Durable _replicator worker
+replicator:
+  enabled: true
+
+# Admins
+#   Plaintext values are pbkdf2-hashed into Postgres
+admins:
+  admin: change-me
+
+log: info

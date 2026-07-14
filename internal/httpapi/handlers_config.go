@@ -1,0 +1,93 @@
+package httpapi
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/couchgres/couchgres/internal/couch"
+)
+
+// /_node/{node}/_config* is the CouchDB-compatible config tree. It is admin-only.
+// Valid node names are routed literally in server.go. Unknown nodes fall
+// through to generic routing (currently a 400 for the reserved _node name).
+// TODO(compat): CouchDB says 404 "no such node: X".
+
+func (s *Server) configAll(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireServerAdmin(r); err != nil {
+		return err
+	}
+	writeJSON(w, 200, s.config.all())
+	return nil
+}
+
+func (s *Server) configSection(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireServerAdmin(r); err != nil {
+		return err
+	}
+	writeJSON(w, 200, s.config.section(r.PathValue("section")))
+	return nil
+}
+
+func (s *Server) configGet(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireServerAdmin(r); err != nil {
+		return err
+	}
+	value, ok := s.config.get(r.PathValue("section"), r.PathValue("key"))
+	if !ok {
+		return couch.NewError(404, "not_found", "unknown_config_value")
+	}
+	writeJSON(w, 200, value)
+	return nil
+}
+
+func (s *Server) configPut(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireServerAdmin(r); err != nil {
+		return err
+	}
+	body, err := readJSONBody(r)
+	if err != nil {
+		return err
+	}
+	value, ok := body.(string)
+	if !ok {
+		return couch.BadRequest("Config value must be a JSON string")
+	}
+	// Plaintext admin passwords hash before they persist, as in CouchDB.
+	// already-hashed values pass through so backups restore cleanly.
+	if r.PathValue("section") == "admins" && !strings.HasPrefix(value, "-pbkdf2:") {
+		value = couch.HashAdminPassword(value,
+			s.config.getInt("couch_httpd_auth", "iterations", 600000))
+	}
+	previous, err := s.config.set(r.Context(), s.store,
+		r.PathValue("section"), r.PathValue("key"), value)
+	if err != nil {
+		return err
+	}
+	s.applyStoreConfig()
+	writeJSON(w, 200, previous)
+	return nil
+}
+
+func (s *Server) configDelete(w http.ResponseWriter, r *http.Request) error {
+	if err := s.requireServerAdmin(r); err != nil {
+		return err
+	}
+	previous, existed, err := s.config.delete(r.Context(), s.store,
+		r.PathValue("section"), r.PathValue("key"))
+	if err != nil {
+		return err
+	}
+	if !existed {
+		return couch.NewError(404, "not_found", "unknown_config_value")
+	}
+	s.applyStoreConfig()
+	writeJSON(w, 200, previous)
+	return nil
+}
+
+// applyStoreConfig mirrors config-tree settings the storage layer acts on.
+// called at startup and after every config write.
+func (s *Server) applyStoreConfig() {
+	s.store.SetKeepSupersededBodies(
+		s.config.getBool("couchgres", "keep_superseded_bodies", false))
+}

@@ -1,0 +1,11 @@
+{
+  "name": "couchgres-client-nano",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "nano": "^10.1.4"
+  },
+  "scripts": {
+    "check": "node check.js"
+  }
+}
