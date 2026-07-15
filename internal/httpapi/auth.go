@@ -327,8 +327,13 @@ func credentialKey(name, password string) [32]byte {
 func (c *credentialCache) get(name, password string) (*couch.UserCtx, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.entries[credentialKey(name, password)]
-	if !ok || time.Now().After(entry.expires) {
+	key := credentialKey(name, password)
+	entry, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(entry.expires) {
+		delete(c.entries, key)
 		return nil, false
 	}
 	return entry.user, true
@@ -338,10 +343,31 @@ func (c *credentialCache) put(name, password string, user *couch.UserCtx) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.entries) >= credentialCacheMax {
-		clear(c.entries)
+		c.evict()
 	}
 	c.entries[credentialKey(name, password)] = credentialEntry{
 		user:    user,
 		expires: time.Now().Add(time.Minute),
+	}
+}
+
+// evict drops expired entries first. If still at capacity it drops an arbitrary
+// quarter, matching viewRespCache
+func (c *credentialCache) evict() {
+	now := time.Now()
+	for k, e := range c.entries {
+		if now.After(e.expires) {
+			delete(c.entries, k)
+		}
+	}
+	if len(c.entries) < credentialCacheMax {
+		return
+	}
+	drop := credentialCacheMax / 4
+	for k := range c.entries {
+		delete(c.entries, k)
+		if drop--; drop <= 0 {
+			break
+		}
 	}
 }
