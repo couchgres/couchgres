@@ -8,10 +8,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/couchgres/couchgres/internal/couch"
 )
 
 func TestSessionLifecycle(t *testing.T) {
-	h := testHandler(t)
+	s := testServer(t, testHTTPStore(t))
+	h := http.Handler(s)
 
 	// Anonymous session: null name, no authenticated marker.
 	resp := send(t, h, "GET", "/_session", nil)
@@ -65,10 +69,46 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 	send(t, h, "DELETE", "/auth_cookie_db", nil, "Cookie", "AuthSession="+cookie)
 
-	// A tampered cookie degrades to anonymous.
+	// A tampered cookie is bad credentials, even where anonymous would be okay.
 	resp = send(t, h, "PUT", "/auth_tampered", nil, "Cookie", "AuthSession=AAAA"+cookie)
-	if resp.status != 401 {
+	if resp.status != 401 || resp.body["reason"] != "Authentication required." {
 		t.Fatalf("tampered cookie: %+v", resp)
+	}
+	resp = send(t, h, "GET", "/", nil, "Cookie", "AuthSession=AAAA"+cookie)
+	if resp.status != 401 || resp.body["reason"] != "Authentication required." {
+		t.Fatalf("tampered cookie on public endpoint: %+v", resp)
+	}
+
+	record, found, err := s.lookupUser(t.Context(), "admin")
+	if err != nil || !found {
+		t.Fatalf("lookup admin: found=%v err=%v", found, err)
+	}
+	expired := couch.EncodeSessionCookie(
+		s.config.cookieSecret(), record.Salt, record.Name,
+		time.Now().Unix()-s.config.sessionTimeout()-1)
+	resp = send(t, h, "GET", "/", nil, "Cookie", "AuthSession="+expired)
+	if resp.status != 401 || resp.body["reason"] != "Authentication required." {
+		t.Fatalf("expired cookie: %+v", resp)
+	}
+	resp = send(t, h, "GET", "/_utils", nil, "Cookie", "AuthSession="+expired)
+	if resp.status != 200 {
+		t.Fatalf("expired cookie should not block Fauxton: %+v", resp)
+	}
+	resp = send(t, h, "GET", "/_session", nil, "Cookie", "AuthSession="+expired)
+	if resp.status != 200 || resp.body["userCtx"].(map[string]any)["name"] != nil {
+		t.Fatalf("expired cookie session should be anonymous: %+v", resp)
+	}
+	resp = send(t, h, "POST", "/_session",
+		decode(t, `{"name":"admin","password":"secret"}`),
+		"Cookie", "AuthSession="+expired)
+	if resp.status != 200 || resp.body["name"] != "admin" {
+		t.Fatalf("expired cookie should not block fresh login: %+v", resp)
+	}
+	resp = send(t, h, "GET", "/_session", nil,
+		"Cookie", "AuthSession="+expired, testAdminAuth, adminAuth())
+	if resp.status != 200 ||
+		resp.body["info"].(map[string]any)["authenticated"] != "default" {
+		t.Fatalf("basic auth with expired cookie: %+v", resp)
 	}
 
 	// Form-encoded login works too.

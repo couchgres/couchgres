@@ -54,8 +54,16 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 // resolveUser returns the principal and, for cookie sessions past 10% of
 // their window, a fresh cookie value to slide the expiry.
 func (s *Server) resolveUser(r *http.Request) (*couch.UserCtx, string, error) {
+	badCookie := false
 	if cookie, err := r.Cookie("AuthSession"); err == nil && cookie.Value != "" {
-		return s.cookieUser(r, cookie.Value)
+		user, refresh, ok, err := s.cookieUser(r, cookie.Value)
+		if err != nil {
+			return nil, "", err
+		}
+		if ok {
+			return user, refresh, nil
+		}
+		badCookie = true
 	}
 	authorization := r.Header.Get("Authorization")
 	if value, ok := strings.CutPrefix(authorization, "Basic "); ok {
@@ -71,31 +79,34 @@ func (s *Server) resolveUser(r *http.Request) (*couch.UserCtx, string, error) {
 			return user, "", err
 		}
 	}
+	if badCookie && !canIgnoreBadSessionCookie(r) {
+		return nil, "", couch.Unauthorized("Authentication required.")
+	}
 	return couch.Anonymous(), "", nil
 }
 
-func (s *Server) cookieUser(r *http.Request, token string) (*couch.UserCtx, string, error) {
-	anonymous := func() (*couch.UserCtx, string, error) {
-		// Malformed, expired, or stale cookies degrade to anonymous
-		// (browser-friendly). TODO(compat): Confirm CouchDB's behavior for
-		// bad MACs specifically.
-		return couch.Anonymous(), "", nil
-	}
+func canIgnoreBadSessionCookie(r *http.Request) bool {
+	path := r.URL.Path
+	return path == "/_session" || path == "/_up" ||
+		path == "/_utils" || strings.HasPrefix(path, "/_utils/")
+}
+
+func (s *Server) cookieUser(r *http.Request, token string) (*couch.UserCtx, string, bool, error) {
 	cookie, ok := couch.DecodeSessionCookie(token)
 	if !ok {
-		return anonymous()
+		return nil, "", false, nil
 	}
 	record, found, err := s.lookupUser(r.Context(), cookie.Name)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	if !found || !cookie.Verify(s.config.cookieSecret(), record.Salt) {
-		return anonymous()
+		return nil, "", false, nil
 	}
 	timeout := s.config.sessionTimeout()
 	age := time.Now().Unix() - cookie.IssuedAt
 	if age < 0 || age > timeout {
-		return anonymous()
+		return nil, "", false, nil
 	}
 	user := &couch.UserCtx{
 		Name:          record.Name,
@@ -107,7 +118,7 @@ func (s *Server) cookieUser(r *http.Request, token string) (*couch.UserCtx, stri
 		refresh = couch.EncodeSessionCookie(
 			s.config.cookieSecret(), record.Salt, record.Name, time.Now().Unix())
 	}
-	return user, refresh, nil
+	return user, refresh, true, nil
 }
 
 func (s *Server) basicUser(r *http.Request, encoded string) (*couch.UserCtx, error) {
