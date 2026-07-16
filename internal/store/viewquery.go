@@ -620,7 +620,14 @@ func (s *Store) queryViewReduce(ctx context.Context, db *DB, vg *ViewGroup, view
 				currentIdent = ident
 			}
 			g := &groups[len(groups)-1]
-			pair, _ := json.Marshal([2]json.RawMessage{json.RawMessage(key), mustJSON(docID)})
+			docIDJSON, err := marshalViewJSON(docID)
+			if err != nil {
+				return nil, err
+			}
+			pair, err := marshalViewJSON([2]json.RawMessage{json.RawMessage(key), docIDJSON})
+			if err != nil {
+				return nil, err
+			}
 			g.keys = append(g.keys, pair)
 			g.values = append(g.values, json.RawMessage(value))
 		}
@@ -751,12 +758,12 @@ func (s *Store) queryViewReduceSQL(ctx context.Context, table, viewName, fn stri
 			coalesce(sum(CASE WHEN %[1]s THEN (value::text)::float8 * (value::text)::float8 END), 0)`, isNum)
 	}
 
-	rowValue := func(g *sqlReduceGroup) json.RawMessage {
+	rowValue := func(g *sqlReduceGroup) (json.RawMessage, error) {
 		switch fn {
 		case "_count":
-			return mustJSON(g.count)
+			return marshalViewJSON(g.count)
 		case "_approx_count_distinct":
-			return mustJSON(g.distinct)
+			return marshalViewJSON(g.distinct)
 		case "_sum":
 			return jsonNumber(g.sum)
 		default: // _stats
@@ -786,7 +793,11 @@ func (s *Store) queryViewReduceSQL(ctx context.Context, table, viewName, fn stri
 			return nil, true, nil
 		}
 		g.distinct = g.count
-		return []ViewRow{{Key: json.RawMessage(`null`), Value: rowValue(&g)}}, true, nil
+		value, err := rowValue(&g)
+		if err != nil {
+			return nil, false, err
+		}
+		return []ViewRow{{Key: json.RawMessage(`null`), Value: value}}, true, nil
 	}
 
 	// Grouped queries aggregate each distinct key in SQL, then merge to group_level here.
@@ -848,7 +859,11 @@ func (s *Store) queryViewReduceSQL(ctx context.Context, table, viewName, fn stri
 	}
 	out := make([]ViewRow, len(groups))
 	for i := range groups {
-		out[i] = ViewRow{Key: groups[i].key, Value: rowValue(&groups[i])}
+		value, err := rowValue(&groups[i])
+		if err != nil {
+			return nil, false, err
+		}
+		out[i] = ViewRow{Key: groups[i].key, Value: value}
 	}
 	if paged {
 		return out, true, nil // Ordered and paged by SQL already.
@@ -862,9 +877,25 @@ type sqlReduceGroup struct {
 	sum, min, max, sumsqr float64
 }
 
-func statsJSON(sum float64, count int64, minV, maxV, sumsqr float64) json.RawMessage {
+func statsJSON(sum float64, count int64, minV, maxV, sumsqr float64) (json.RawMessage, error) {
+	sumJSON, err := jsonNumber(sum)
+	if err != nil {
+		return nil, err
+	}
+	minJSON, err := jsonNumber(minV)
+	if err != nil {
+		return nil, err
+	}
+	maxJSON, err := jsonNumber(maxV)
+	if err != nil {
+		return nil, err
+	}
+	sumsqrJSON, err := jsonNumber(sumsqr)
+	if err != nil {
+		return nil, err
+	}
 	return json.RawMessage(fmt.Sprintf(`{"sum":%s,"count":%d,"min":%s,"max":%s,"sumsqr":%s}`,
-		jsonNumber(sum), count, jsonNumber(minV), jsonNumber(maxV), jsonNumber(sumsqr)))
+		sumJSON, count, minJSON, maxJSON, sumsqrJSON)), nil
 }
 
 type reduceRowGroup struct {
@@ -957,7 +988,11 @@ func builtinReduce(fn string, groups []reduceRowGroup) ([]json.RawMessage, error
 		g := &groups[gi]
 		switch fn {
 		case "_count":
-			out[gi] = mustJSON(len(g.values))
+			count, err := marshalViewJSON(len(g.values))
+			if err != nil {
+				return nil, err
+			}
+			out[gi] = count
 		case "_sum":
 			sum, err := sumValues(g.values)
 			if err != nil {
@@ -987,7 +1022,11 @@ func builtinReduce(fn string, groups []reduceRowGroup) ([]json.RawMessage, error
 					prev = ident
 				}
 			}
-			out[gi] = mustJSON(distinct)
+			distinctJSON, err := marshalViewJSON(distinct)
+			if err != nil {
+				return nil, err
+			}
+			out[gi] = distinctJSON
 		case "_first":
 			out[gi] = g.values[0]
 		case "_last":
@@ -1055,7 +1094,7 @@ func extremeValues(values []json.RawMessage, nStr string, top bool) (json.RawMes
 	for i, e := range distinct {
 		out[i] = e.raw
 	}
-	return mustJSON(out), nil
+	return marshalViewJSON(out)
 }
 
 // sumValues implements _sum for numbers or arrays of numbers summed
@@ -1100,9 +1139,9 @@ func sumValues(values []json.RawMessage) (json.RawMessage, error) {
 			}
 			vector[0] += scalar
 		}
-		return mustJSON(vector), nil
+		return marshalViewJSON(vector)
 	}
-	return jsonNumber(scalar), nil
+	return jsonNumber(scalar)
 }
 
 func statsValues(values []json.RawMessage) (json.RawMessage, error) {
@@ -1131,8 +1170,7 @@ func statsValues(values []json.RawMessage) (json.RawMessage, error) {
 		}
 		first = false
 	}
-	return json.RawMessage(fmt.Sprintf(`{"sum":%s,"count":%d,"min":%s,"max":%s,"sumsqr":%s}`,
-		jsonNumber(sum), len(values), jsonNumber(minV), jsonNumber(maxV), jsonNumber(sumsqr))), nil
+	return statsJSON(sum, int64(len(values)), minV, maxV, sumsqr)
 }
 
 func builtinReduceError(fn string, value json.RawMessage) error {
@@ -1141,20 +1179,19 @@ func builtinReduceError(fn string, value json.RawMessage) error {
 }
 
 // jsonNumber renders a float the way JSON does, preferring integer form.
-func jsonNumber(f float64) json.RawMessage {
+func jsonNumber(f float64) (json.RawMessage, error) {
 	if f == math.Trunc(f) && math.Abs(f) < 1e15 {
-		return json.RawMessage(strconv.FormatInt(int64(f), 10))
+		return json.RawMessage(strconv.FormatInt(int64(f), 10)), nil
 	}
-	raw, _ := json.Marshal(f)
-	return raw
+	return marshalViewJSON(f)
 }
 
-func mustJSON(v any) json.RawMessage {
+func marshalViewJSON(v any) (json.RawMessage, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("marshal view JSON: %w", err)
 	}
-	return raw
+	return raw, nil
 }
 
 func min64(a, b int64) int64 {
