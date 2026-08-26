@@ -53,6 +53,10 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) error {
 		return couch.BadRequest("Config value must be a JSON string")
 	}
 	section, key := r.PathValue("section"), r.PathValue("key")
+	if section == "chttpd" && key == "secure_rewrites" &&
+		value != "true" && value != "false" {
+		return couch.BadRequest("secure_rewrites must be true or false")
+	}
 	if err := validateRequestBodySizeChange(section, key, value); err != nil {
 		return couch.BadRequest(err.Error())
 	}

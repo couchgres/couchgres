@@ -145,6 +145,12 @@ func (c *configCache) cookieSecret() string {
 	return c.getOr("couch_httpd_auth", "secret", "")
 }
 
+// secureRewrites fails closed: only the explicit value "false" enables
+// cross-scope rewrite behavior.
+func (c *configCache) secureRewrites() bool {
+	return c.getOr("chttpd", "secure_rewrites", "true") != "false"
+}
+
 func (c *configCache) passwordIterations() int {
 	iterations, _, _, err := c.passwordIterationSettings("", "")
 	if err != nil {

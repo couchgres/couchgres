@@ -300,6 +300,128 @@ func TestRewrite(t *testing.T) {
 	}
 }
 
+func TestFunctionRewriteSecurityBoundaries(t *testing.T) {
+	h := testHandler(t)
+	admin := adminAuth()
+	if resp := send(t, h, "PUT", "/_node/_local/_config/chttpd/secure_rewrites",
+		"invalid", testAdminAuth, admin); resp.status != 400 {
+		t.Fatalf("invalid secure_rewrites config: %+v", resp)
+	}
+	securePath := "/_node/_local/_config/chttpd/secure_rewrites"
+	previousSecure := send(t, h, "GET", securePath, nil, testAdminAuth, admin)
+	if resp := send(t, h, "PUT", securePath, "true",
+		testAdminAuth, admin); resp.status != 200 {
+		t.Fatalf("enable secure rewrites: %+v", resp)
+	}
+	defer func() {
+		if previousSecure.status == 200 {
+			send(t, h, "PUT", securePath, previousSecure.scalar,
+				testAdminAuth, admin)
+		} else {
+			send(t, h, "DELETE", securePath, nil, testAdminAuth, admin)
+		}
+	}()
+	send(t, h, "DELETE", "/_node/_local/_config/couchgres/sec03_probe", nil,
+		testAdminAuth, admin)
+	const userName = "sec03_db_admin"
+	const password = "sec03-password"
+	userAuth := basicAuth(userName, password)
+	userDoc := map[string]any{
+		"type": "user", "name": userName, "roles": []any{}, "password": password,
+	}
+	userPath := "/_users/org.couchdb.user:" + userName
+	if resp := send(t, h, "PUT", userPath, userDoc, testAdminAuth, admin); resp.status == 409 {
+		current := send(t, h, "GET", userPath, nil, testAdminAuth, admin)
+		resp = send(t, h, "PUT", userPath+"?rev="+current.body["_rev"].(string),
+			userDoc, testAdminAuth, admin)
+		if resp.status != 201 {
+			t.Fatalf("reset rewrite DB admin: %+v", resp)
+		}
+	} else if resp.status != 201 {
+		t.Fatalf("create rewrite DB admin: %+v", resp)
+	}
+
+	const db = "rewrite_security"
+	send(t, h, "DELETE", "/"+db, nil, testAdminAuth, admin)
+	if resp := send(t, h, "PUT", "/"+db, nil, testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("create source db: %+v", resp)
+	}
+	defer send(t, h, "DELETE", "/"+db, nil, testAdminAuth, admin)
+	security := map[string]any{
+		"admins":  map[string]any{"names": []any{userName}, "roles": []any{}},
+		"members": map[string]any{"names": []any{userName}, "roles": []any{}},
+	}
+	if resp := send(t, h, "PUT", "/"+db+"/_security", security,
+		testAdminAuth, admin); resp.status != 200 {
+		t.Fatalf("source security: %+v", resp)
+	}
+	if resp := send(t, h, "PUT", "/"+db+"/doc", map[string]any{"safe": true},
+		testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("source doc: %+v", resp)
+	}
+
+	rewriter := `function(req) {
+  var action = req.path[req.path.length - 1];
+  if (action === 'cross') return {
+    path: '/_node/_local/_config/couchgres/sec03_probe',
+    method: 'PUT', headers: {'Content-Type': 'application/json'}, body: '"owned"'
+  };
+  if (action === 'method') return {
+    path: '../../created', method: 'PUT',
+    headers: {'Content-Type': 'application/json'}, body: '{}'
+  };
+  if (action === 'header') return {
+    path: '../../doc', headers: {Authorization: 'Basic injected'}
+  };
+  if (action === 'credentials') return {
+    body: req.headers.Authorization || req.headers.Cookie || 'clean'
+  };
+  return {path: '../../doc'};
+}`
+	ddoc := map[string]any{"rewrites": rewriter}
+	if resp := send(t, h, "PUT", "/"+db+"/_design/app", ddoc,
+		testAdminAuth, userAuth); resp.status != 201 {
+		t.Fatalf("DB admin writes rewriter: %+v", resp)
+	}
+	login := send(t, h, "POST", "/_session",
+		map[string]any{"name": "admin", "password": "secret"})
+	if login.status != 200 {
+		t.Fatalf("server-admin session: %+v", login)
+	}
+	adminCookie := strings.SplitN(login.header.Get("Set-Cookie"), ";", 2)[0]
+	visitorHeaders := map[string]string{
+		"Authorization": "",
+		"Cookie":        adminCookie,
+	}
+
+	// The internal dispatch keeps the resolved server-admin userCtx even
+	// though raw credentials are removed before the target sees the request.
+	base := "/" + db + "/_design/app/_rewrite/"
+	resp := sendRaw(t, h, "GET", base+"safe", "", visitorHeaders)
+	if resp.status != 200 || !strings.Contains(resp.raw, `"safe":true`) {
+		t.Fatalf("safe rewrite: %d %q", resp.status, resp.raw)
+	}
+	resp = sendRaw(t, h, "GET", base+"credentials", "", visitorHeaders)
+	if resp.status != 200 || resp.raw != "clean" {
+		t.Fatalf("credential exposure: %d %q", resp.status, resp.raw)
+	}
+
+	for _, action := range []string{"cross", "method", "header"} {
+		resp = sendRaw(t, h, "GET", base+action, "", visitorHeaders)
+		if resp.status != 500 || !strings.Contains(resp.raw, `"error":"insecure_rewrite_rule"`) {
+			t.Errorf("%s rewrite: %d %q", action, resp.status, resp.raw)
+		}
+	}
+	if resp := send(t, h, "GET", "/"+db+"/created", nil,
+		testAdminAuth, admin); resp.status != 404 {
+		t.Fatalf("method rewrite created a document: %+v", resp)
+	}
+	if resp := send(t, h, "GET", "/_node/_local/_config/couchgres/sec03_probe", nil,
+		testAdminAuth, admin); resp.status != 404 {
+		t.Fatalf("cross-scope rewrite changed config: %+v", resp)
+	}
+}
+
 func TestClusterStubs(t *testing.T) {
 	h := testHandler(t)
 	admin := adminAuth()

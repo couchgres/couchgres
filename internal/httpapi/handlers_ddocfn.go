@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/couchgres/couchgres/internal/couch"
@@ -567,14 +568,19 @@ func (s *Server) rewriteHandler(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		rewrite = &rewriteResult{target: target, query: query, fromRules: true}
+		rewrite = &rewriteResult{target: target, query: query}
 	case string:
-		rewrite, err = s.applyRewriteFunction(r, db, ddoc, rules, subPath, bodyBytes)
+		rewriteRequest := s.sanitizedRewriteRequest(r)
+		rewrite, err = s.applyRewriteFunction(
+			rewriteRequest, db, ddoc, rules, subPath, bodyBytes)
 		if err != nil {
 			return err
 		}
 	default:
 		return couch.NotFound()
+	}
+	if err := s.validateRewriteHeaders(rewrite.headers); err != nil {
+		return err
 	}
 	if rewrite.direct != nil {
 		// The rewriter answered directly instead of naming a target.
@@ -585,15 +591,16 @@ func (s *Server) rewriteHandler(w http.ResponseWriter, r *http.Request) error {
 	// name containing "/" survives the re-dispatch as one segment.
 	base := "/" + url.PathEscape(db.Name) + "/_design/" + url.PathEscape(ddocName) + "/"
 	resolved := resolveRewritePath(base, rewrite.target)
-	// Rewrites may climb to the db root but never above it (CouchDB's
-	// secure_rewrites, on by default).
-	if rewrite.fromRules && s.config.getBool("chttpd", "secure_rewrites", true) &&
-		resolved != "/"+url.PathEscape(db.Name) &&
-		!strings.HasPrefix(resolved, "/"+url.PathEscape(db.Name)+"/") {
-		return couch.NewError(500, "insecure_rewrite_rule", "path must begin with the database")
+	targetMethod, err := s.authorizeRewrite(r, db.Name, resolved, rewrite.method)
+	if err != nil {
+		return err
 	}
 
-	r2 := r.Clone(context.WithValue(r.Context(), rewriteDepthKey{}, depth+1))
+	// Do not re-run authentication with the visitor's Cookie, Authorization,
+	// proxy-auth, or forwarding headers. The already-resolved userCtx remains
+	// in the cloned context and every target handler re-runs authorization.
+	r2 := s.sanitizedRewriteRequest(r)
+	r2 = r2.Clone(context.WithValue(r2.Context(), rewriteDepthKey{}, depth+1))
 	if unescaped, err := url.PathUnescape(resolved); err == nil && unescaped != resolved {
 		r2.URL.RawPath = resolved
 		r2.URL.Path = unescaped
@@ -603,9 +610,7 @@ func (s *Server) rewriteHandler(w http.ResponseWriter, r *http.Request) error {
 	}
 	r2.URL.RawQuery = rewrite.query.Encode()
 	r2.RequestURI = ""
-	if rewrite.method != "" {
-		r2.Method = strings.ToUpper(rewrite.method)
-	}
+	r2.Method = targetMethod
 	for key, value := range rewrite.headers {
 		r2.Header.Set(key, value)
 	}
@@ -616,7 +621,7 @@ func (s *Server) rewriteHandler(w http.ResponseWriter, r *http.Request) error {
 		r2.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		r2.ContentLength = int64(len(bodyBytes))
 	}
-	s.handler.ServeHTTP(w, r2)
+	s.router.ServeHTTP(w, r2)
 	return nil
 }
 
@@ -745,9 +750,6 @@ type rewriteResult struct {
 	headers map[string]string
 	body    *string
 	direct  json.RawMessage
-	// fromRules marks array-rule results. Only those use secure_rewrites
-	// (function rewriters are admin-authored and may leave the db).
-	fromRules bool
 }
 
 func (s *Server) applyRewriteFunction(r *http.Request, db *store.DB, ddoc *store.DocRow, src, subPath string, body []byte) (*rewriteResult, error) {
@@ -779,7 +781,7 @@ func (s *Server) applyRewriteFunction(r *http.Request, db *store.DB, ddoc *store
 	if resp.Path == "" {
 		// With no target, the returned object is the response itself.
 		if resp.Code != nil || resp.Body != nil {
-			return &rewriteResult{direct: result}, nil
+			return &rewriteResult{direct: result, headers: resp.Headers}, nil
 		}
 		return nil, couch.NotFound()
 	}
@@ -798,6 +800,112 @@ func (s *Server) applyRewriteFunction(r *http.Request, db *store.DB, ddoc *store
 		target: resp.Path, query: query,
 		method: resp.Method, headers: resp.Headers, body: resp.Body,
 	}, nil
+}
+
+func (s *Server) authorizeRewrite(
+	r *http.Request,
+	dbName, resolvedPath, requestedMethod string,
+) (string, error) {
+	method := r.Method
+	if requestedMethod != "" {
+		if !validHTTPToken(requestedMethod) {
+			return "", couch.NewError(500, "insecure_rewrite_rule", "invalid rewrite method")
+		}
+		method = strings.ToUpper(requestedMethod)
+	}
+	withinDB := rewritePathWithinDatabase(resolvedPath, dbName)
+	methodChanged := method != r.Method
+	if s.config.secureRewrites() {
+		switch {
+		case !withinDB:
+			return "", couch.NewError(
+				500, "insecure_rewrite_rule", "path must begin with the database")
+		case methodChanged:
+			return "", couch.NewError(
+				500, "insecure_rewrite_rule", "rewrite method must match the request method")
+		}
+	} else if (!withinDB || methodChanged) && !userOf(r).IsServerAdmin() {
+		return "", couch.ServerAdminRequired()
+	}
+	return method, nil
+}
+
+func rewritePathWithinDatabase(resolvedPath, dbName string) bool {
+	unescaped, err := url.PathUnescape(resolvedPath)
+	if err != nil {
+		return false
+	}
+	cleaned := path.Clean("/" + strings.TrimPrefix(unescaped, "/"))
+	dbRoot := "/" + dbName
+	return cleaned == dbRoot || strings.HasPrefix(cleaned, dbRoot+"/")
+}
+
+func (s *Server) sanitizedRewriteRequest(r *http.Request) *http.Request {
+	clone := r.Clone(r.Context())
+	clone.Header = r.Header.Clone()
+	for name := range clone.Header {
+		if s.sensitiveRewriteHeader(name) {
+			delete(clone.Header, name)
+		}
+	}
+	return clone
+}
+
+func (s *Server) validateRewriteHeaders(headers map[string]string) error {
+	for name, value := range headers {
+		if !validHTTPToken(name) || strings.ContainsAny(value, "\r\n\x00") {
+			return couch.NewError(
+				500, "insecure_rewrite_rule", "rewrite contains an invalid header")
+		}
+		if s.sensitiveRewriteHeader(name) {
+			return couch.NewError(500, "insecure_rewrite_rule",
+				"rewrite may not set security-sensitive header "+http.CanonicalHeaderKey(name))
+		}
+	}
+	return nil
+}
+
+func (s *Server) sensitiveRewriteHeader(name string) bool {
+	name = strings.ToLower(name)
+	if name == strings.ToLower(s.config.getOr(
+		"couch_httpd_auth", "x_auth_username", "X-Auth-CouchDB-UserName")) ||
+		name == strings.ToLower(s.config.getOr(
+			"couch_httpd_auth", "x_auth_roles", "X-Auth-CouchDB-Roles")) ||
+		name == strings.ToLower(s.config.getOr(
+			"couch_httpd_auth", "x_auth_token", "X-Auth-CouchDB-Token")) ||
+		name == strings.ToLower(s.config.getOr(
+			"chttpd", "x_forwarded_host", "X-Forwarded-Host")) {
+		return true
+	}
+	if strings.HasPrefix(name, "x-auth-couchdb-") ||
+		strings.HasPrefix(name, "x-forwarded-") {
+		return true
+	}
+	switch name {
+	case "authorization", "cookie", "set-cookie",
+		"proxy-authorization", "proxy-authenticate", "www-authenticate",
+		"forwarded", "x-real-ip", "x-http-method-override",
+		"host", "content-length", "connection", "keep-alive", "te",
+		"trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func validHTTPToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // resolveRewritePath joins target onto base, folding "." and ".." segments.

@@ -24,6 +24,7 @@ type Server struct {
 	scheduler          *replicate.Scheduler
 	lifetime           context.Context
 	handler            http.Handler
+	router             http.Handler
 	serverUUID         string
 	maxUUIDCount       int
 	credentialCache    *credentialCache
@@ -277,6 +278,7 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 			case http.MethodPut, http.MethodDelete:
 				r.Method = strings.ToUpper(override)
 			}
+			r.Header.Del("X-HTTP-Method-Override")
 		}
 		_, pattern := mux.Handler(r)
 		release, ok := s.protectRequestBody(w, r, pattern)
@@ -308,6 +310,7 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 		}
 		mux.ServeHTTP(w, r)
 	})
+	s.router = root
 	s.handler = couchHeaders(s.authenticate(root))
 	return s, nil
 }
