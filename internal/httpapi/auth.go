@@ -137,9 +137,12 @@ func (s *Server) basicUser(r *http.Request, encoded string) (*couch.UserCtx, err
 	if err != nil {
 		return nil, err
 	}
-	if !found || record.Password == nil ||
-		!couch.VerifyPassword(password, record.Password) {
-		return nil, couch.Unauthorized("Name or password is incorrect.")
+	var hash *couch.HashedPassword
+	if found {
+		hash = record.Password
+	}
+	if err := s.passwordAuth.verify(r, name, password, hash, s.config.passwordPolicy()); err != nil {
+		return nil, err
 	}
 	user := &couch.UserCtx{
 		Name:          record.Name,
@@ -268,8 +271,11 @@ func (s *Server) lookupUser(ctx context.Context, name string) (*couch.UserRecord
 	if stored, ok := s.config.adminPassword(name); ok {
 		record := &couch.UserRecord{Name: name, Roles: []string{"_admin"}}
 		if h, ok := couch.ParseAdminPassword(stored); ok {
-			record.Salt = h.Salt
-			record.Password = h
+			minIterations, maxIterations := s.config.passwordIterationBounds()
+			if h.Validate(minIterations, maxIterations) == nil {
+				record.Salt = h.Salt
+				record.Password = h
+			}
 		}
 		return record, true, nil
 	}

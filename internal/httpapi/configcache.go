@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/couchgres/couchgres/internal/couch"
 	"github.com/couchgres/couchgres/internal/store"
@@ -144,7 +146,89 @@ func (c *configCache) cookieSecret() string {
 }
 
 func (c *configCache) passwordIterations() int {
-	return c.getInt("couch_httpd_auth", "iterations", couch.DefaultIterations)
+	iterations, _, _, err := c.passwordIterationSettings("", "")
+	if err != nil {
+		return couch.DefaultIterations
+	}
+	return iterations
+}
+
+func (c *configCache) passwordIterationBounds() (int, int) {
+	_, minIterations, maxIterations, err := c.passwordIterationSettings("", "")
+	if err != nil {
+		return couch.MinPasswordIterations, couch.MaxPasswordIterations
+	}
+	return minIterations, maxIterations
+}
+
+func (c *configCache) validatePasswordIterationChange(key, value string) error {
+	_, _, _, err := c.passwordIterationSettings(key, value)
+	return err
+}
+
+func (c *configCache) passwordIterationSettings(
+	overrideKey, overrideValue string,
+) (iterations, minIterations, maxIterations int, err error) {
+	read := func(key string, fallback int) (int, error) {
+		value := c.getOr("couch_httpd_auth", key, strconv.Itoa(fallback))
+		if key == overrideKey {
+			value = overrideValue
+		}
+		n, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			return 0, fmt.Errorf("%s must be an integer", key)
+		}
+		return n, nil
+	}
+	iterations, err = read("iterations", couch.DefaultIterations)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	minIterations, err = read("min_iterations", couch.MinPasswordIterations)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	maxIterations, err = read("max_iterations", couch.MaxPasswordIterations)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if err = couch.ValidatePasswordIterationRange(minIterations, maxIterations); err != nil {
+		return 0, 0, 0, err
+	}
+	if iterations < minIterations || iterations > maxIterations {
+		return 0, 0, 0, fmt.Errorf(
+			"iterations must be between min_iterations (%d) and max_iterations (%d)",
+			minIterations, maxIterations)
+	}
+	return iterations, minIterations, maxIterations, nil
+}
+
+func (c *configCache) passwordPolicy() passwordPolicy {
+	minIterations, maxIterations := c.passwordIterationBounds()
+	mode := c.getOr("chttpd_auth_lockout", "mode", "enforce")
+	if mode != "off" && mode != "warn" && mode != "enforce" {
+		mode = "enforce"
+	}
+	threshold := c.getInt("chttpd_auth_lockout", "threshold", 5)
+	if threshold < 1 || threshold > 1_000 {
+		threshold = 5
+	}
+	maxObjects := c.getInt("chttpd_auth_lockout", "max_objects", 10_000)
+	if maxObjects < 1 || maxObjects > 100_000 {
+		maxObjects = 10_000
+	}
+	lifetimeMS := c.getInt("chttpd_auth_lockout", "max_lifetime", 300_000)
+	if lifetimeMS < 1_000 || lifetimeMS > int((24*time.Hour)/time.Millisecond) {
+		lifetimeMS = 300_000
+	}
+	return passwordPolicy{
+		minIterations: minIterations,
+		maxIterations: maxIterations,
+		lockoutMode:   mode,
+		lockoutLimit:  threshold,
+		lockoutPeriod: time.Duration(lifetimeMS) * time.Millisecond,
+		lockoutMax:    maxObjects,
+	}
 }
 
 func (c *configCache) adminPassword(name string) (string, bool) {

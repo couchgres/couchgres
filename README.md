@@ -64,10 +64,12 @@ curl http://127.0.0.1:5984/
 
 CouchDB-style settings are stored in PostgreSQL and exposed through `/_node/_local/_config/*`. The config API also supports CouchDB sections such as `couch_httpd_auth` and `chttpd`.
 
-| Setting                            | Description                                                                                                                                                                                                             |
-|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `couchdb/default_security`         | `admin_only`, the CouchDB 3.x default, or `everyone` for public databases like pre 3.x CouchDB.                                                                                                                         |
-| `couchgres/keep_superseded_bodies` | Defaults to `false`, which removes a revision body when a newer revision replaces it. Set it to `true` to keep superseded bodies readable through `?rev=` until `POST /{db}/_compact`. Changes take effect immediately. |
+| Setting                                                         | Description                                                                                                                                                                                                             |
+|-----------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `couchdb/default_security`                                      | `admin_only`, the CouchDB 3.x default, or `everyone` for public databases like pre 3.x CouchDB.                                                                                                                         |
+| `couchgres/keep_superseded_bodies`                              | Defaults to `false`, which removes a revision body when a newer revision replaces it. Set it to `true` to keep superseded bodies readable through `?rev=` until `POST /{db}/_compact`. Changes take effect immediately. |
+| `couch_httpd_auth/{iterations,min_iterations,max_iterations}`   | PBKDF2 work-factor policy. The default is 600,000 iterations; runtime bounds may narrow but cannot exceed the process safety ceiling of 1,200,000.                                                                      |
+| `chttpd_auth_lockout/{mode,threshold,max_objects,max_lifetime}` | Repeated username/client-IP failure policy. Defaults to `enforce`, 5 failures, 10,000 tracked pairs, and a five-minute lifetime.                                                                                        |
 
 ## Performance and Benchmarks
 

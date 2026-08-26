@@ -18,9 +18,12 @@ func (s *Server) sessionPost(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if !found || record.Password == nil ||
-		!couch.VerifyPassword(password, record.Password) {
-		return couch.Unauthorized("Name or password is incorrect.")
+	var hash *couch.HashedPassword
+	if found {
+		hash = record.Password
+	}
+	if err := s.passwordAuth.verify(r, name, password, hash, s.config.passwordPolicy()); err != nil {
+		return err
 	}
 
 	token := couch.EncodeSessionCookie(

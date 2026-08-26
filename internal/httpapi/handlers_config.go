@@ -52,14 +52,34 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return couch.BadRequest("Config value must be a JSON string")
 	}
+	section, key := r.PathValue("section"), r.PathValue("key")
+	if section == "couch_httpd_auth" &&
+		(key == "iterations" || key == "min_iterations" || key == "max_iterations") {
+		if err := s.config.validatePasswordIterationChange(key, value); err != nil {
+			return couch.BadRequest(err.Error())
+		}
+	}
 	// Plaintext admin passwords hash before they persist, as in CouchDB.
 	// already-hashed values pass through so backups restore cleanly.
-	if r.PathValue("section") == "admins" && !strings.HasPrefix(value, "-pbkdf2:") {
-		value = couch.HashAdminPassword(value,
-			s.config.getInt("couch_httpd_auth", "iterations", 600000))
+	if section == "admins" {
+		value, err = s.passwordAuth.hashAdminPassword(
+			r.Context(), value, s.config.passwordIterations())
+		if err != nil {
+			if r.Context().Err() != nil {
+				return r.Context().Err()
+			}
+			return couch.BadRequest("Invalid administrator password hash")
+		}
+		if h, parsed := couch.ParseAdminPassword(value); parsed {
+			minIterations, maxIterations := s.config.passwordIterationBounds()
+			if err := h.Validate(minIterations, maxIterations); err != nil {
+				return couch.BadRequest("Administrator password iterations are outside the configured range")
+			}
+		} else if strings.HasPrefix(value, "-pbkdf2") {
+			return couch.BadRequest("Invalid administrator password hash")
+		}
 	}
-	previous, err := s.config.set(r.Context(), s.store,
-		r.PathValue("section"), r.PathValue("key"), value)
+	previous, err := s.config.set(r.Context(), s.store, section, key, value)
 	if err != nil {
 		return err
 	}

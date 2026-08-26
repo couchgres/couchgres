@@ -128,11 +128,19 @@ func (s *Server) prepareUsersWrite(
 	if row, err := s.store.GetDocAny(r.Context(), db, docid); err == nil && !row.Deleted {
 		old = row.Body
 	}
-	if err := couch.ValidateUserDoc(docid, body, old, deleting, userOf(r)); err != nil {
+	minIterations, maxIterations := s.config.passwordIterationBounds()
+	if err := couch.ValidateUserDoc(docid, body, old, deleting, userOf(r),
+		minIterations, maxIterations); err != nil {
 		return err
 	}
 	if !deleting {
-		couch.PrepareUserDoc(body, s.config.passwordIterations())
+		if err := s.passwordAuth.prepareUserDoc(
+			r.Context(), body, s.config.passwordIterations()); err != nil {
+			if r.Context().Err() != nil {
+				return r.Context().Err()
+			}
+			return couch.BadRequest("Invalid password hashing configuration")
+		}
 	}
 	return nil
 }

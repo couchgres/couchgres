@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -294,6 +295,68 @@ func TestUsersDBAndMembership(t *testing.T) {
 	resp = send(t, h, "POST", "/_session", decode(t, `{"name":"bob","password":"pw-bob"}`))
 	if resp.status != 200 || resp.body["name"] != "bob" {
 		t.Fatalf("bob session login: %+v", resp)
+	}
+}
+
+func TestPasswordIterationGuards(t *testing.T) {
+	h := testHandler(t)
+	admin := adminAuth()
+	const username = "iteration-guard-user"
+	docPath := "/_users/" + couch.UserDocPrefix + username
+
+	// Ensure the fixture exists with a valid server-generated hash.
+	resp := send(t, h, "PUT", docPath, decode(t,
+		`{"type":"user","name":"`+username+`","roles":[],"password":"secret"}`),
+		testAdminAuth, admin)
+	if resp.status == 409 {
+		current := send(t, h, "GET", docPath, nil, testAdminAuth, admin)
+		rev := current.body["_rev"].(string)
+		resp = send(t, h, "PUT", docPath+"?rev="+rev, decode(t,
+			`{"type":"user","name":"`+username+`","roles":[],"password":"secret"}`),
+			testAdminAuth, admin)
+	}
+	if resp.status != 201 {
+		t.Fatalf("create iteration guard user: %+v", resp)
+	}
+
+	userAuth := basicAuth(username, "secret")
+	current := send(t, h, "GET", docPath, nil, testAdminAuth, userAuth)
+	if current.status != 200 {
+		t.Fatalf("read own user: %+v", current)
+	}
+	rev := current.body["_rev"].(string)
+	unsafeDoc := map[string]any{
+		"type":            "user",
+		"name":            username,
+		"roles":           []any{},
+		"password_scheme": "pbkdf2:sha256",
+		"derived_key":     strings.Repeat("0", 64),
+		"salt":            "0123456789abcdef",
+		"iterations":      couch.MaxPasswordIterations + 1,
+	}
+	resp = send(t, h, "PUT", docPath+"?rev="+rev, unsafeDoc,
+		testAdminAuth, userAuth)
+	if resp.status != 403 || resp.body["reason"] != "Invalid password hash parameters." {
+		t.Fatalf("unsafe user hash: %+v", resp)
+	}
+
+	tooMany := strconv.Itoa(couch.MaxPasswordIterations + 1)
+	for _, path := range []string{
+		"/_node/_local/_config/couch_httpd_auth/iterations",
+		"/_node/_local/_config/couch_httpd_auth/max_iterations",
+	} {
+		resp = send(t, h, "PUT", path, tooMany, testAdminAuth, admin)
+		if resp.status != 400 {
+			t.Fatalf("unsafe iteration config %s: %+v", path, resp)
+		}
+	}
+
+	unsafeAdmin := "-pbkdf2:sha256-" + strings.Repeat("0", 64) +
+		",0123456789abcdef," + tooMany
+	resp = send(t, h, "PUT", "/_node/_local/_config/admins/unsafe-admin",
+		unsafeAdmin, testAdminAuth, admin)
+	if resp.status != 400 {
+		t.Fatalf("unsafe administrator hash: %+v", resp)
 	}
 }
 

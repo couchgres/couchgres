@@ -27,6 +27,7 @@ type Server struct {
 	serverUUID      string
 	maxUUIDCount    int
 	credentialCache *credentialCache
+	passwordAuth    *passwordAuthenticator
 	js              *jsengine.Pool
 	mapper          jsMapper
 	reducer         jsReducer
@@ -89,6 +90,7 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 		serverUUID:      serverUUID,
 		maxUUIDCount:    1000,
 		credentialCache: newCredentialCache(),
+		passwordAuth:    newPasswordAuthenticator(),
 		js:              jsengine.NewPool(0, 5*time.Second),
 		vdu:             newVDUCache(),
 		viewCache:       newViewRespCache(),

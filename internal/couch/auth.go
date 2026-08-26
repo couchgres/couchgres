@@ -8,6 +8,8 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -15,8 +17,21 @@ import (
 	"golang.org/x/crypto/pbkdf2"
 )
 
-// DefaultIterations is the pbkdf2-sha256 iteration count CouchDB 3.4+ uses.
-const DefaultIterations = 600_000
+const (
+	// DefaultIterations is the pbkdf2-sha256 iteration count CouchDB 3.4+ uses.
+	DefaultIterations = 600_000
+
+	// Password iteration limits are a process-level safety boundary. Runtime
+	// min_iterations/max_iterations settings may narrow this range, but may not
+	// expand it: PBKDF2 runs synchronously and an attacker-controlled work factor
+	// must never be able to monopolize a server indefinitely.
+	MinPasswordIterations = 1
+	MaxPasswordIterations = 1_200_000
+
+	maxPasswordSaltBytes = 256
+)
+
+var ErrInvalidPasswordHash = errors.New("invalid password hash")
 
 // HashedPassword holds the pbkdf2 fields as stored in _users docs.
 type HashedPassword struct {
@@ -27,20 +42,79 @@ type HashedPassword struct {
 	Iterations int
 }
 
+// Validate checks both the stored hash shape and the configured work-factor
+// range before any password derivation begins.
+func (h *HashedPassword) Validate(minIterations, maxIterations int) error {
+	if h == nil {
+		return ErrInvalidPasswordHash
+	}
+	if err := ValidatePasswordIterationRange(minIterations, maxIterations); err != nil {
+		return err
+	}
+	if h.Iterations < minIterations || h.Iterations > maxIterations {
+		return fmt.Errorf("%w: iterations must be between %d and %d",
+			ErrInvalidPasswordHash, minIterations, maxIterations)
+	}
+	derivedBytes := 0
+	switch h.Scheme {
+	case "pbkdf2":
+		derivedBytes = sha1.Size
+	case "pbkdf2:sha256":
+		derivedBytes = sha256.Size
+	default:
+		return fmt.Errorf("%w: unsupported scheme", ErrInvalidPasswordHash)
+	}
+	if len(h.DerivedKey) != hex.EncodedLen(derivedBytes) {
+		return fmt.Errorf("%w: invalid derived key length", ErrInvalidPasswordHash)
+	}
+	if _, err := hex.DecodeString(h.DerivedKey); err != nil {
+		return fmt.Errorf("%w: invalid derived key encoding", ErrInvalidPasswordHash)
+	}
+	if h.Salt == "" || len(h.Salt) > maxPasswordSaltBytes {
+		return fmt.Errorf("%w: invalid salt length", ErrInvalidPasswordHash)
+	}
+	return nil
+}
+
+// ValidatePasswordIterationRange validates configured PBKDF2 bounds. The hard
+// maximum cannot be raised through CouchDB's runtime configuration API.
+func ValidatePasswordIterationRange(minIterations, maxIterations int) error {
+	if minIterations < MinPasswordIterations ||
+		maxIterations < minIterations ||
+		maxIterations > MaxPasswordIterations {
+		return fmt.Errorf("password iterations must satisfy %d <= min <= max <= %d",
+			MinPasswordIterations, MaxPasswordIterations)
+	}
+	return nil
+}
+
 // HashUserPassword hashes a plaintext password the way CouchDB 3.4+ does.
+// Invalid work factors return a zero hash without doing any derivation. Request
+// paths that need an actionable error use HashUserPasswordChecked.
 func HashUserPassword(password string, iterations int) HashedPassword {
+	h, _ := HashUserPasswordChecked(password, iterations)
+	return h
+}
+
+func HashUserPasswordChecked(password string, iterations int) (HashedPassword, error) {
+	if err := ValidatePasswordIterationRange(iterations, iterations); err != nil {
+		return HashedPassword{}, err
+	}
 	salt := randomHexString(16)
 	return HashedPassword{
 		Scheme:     "pbkdf2:sha256",
 		DerivedKey: deriveSHA256(password, salt, iterations),
 		Salt:       salt,
 		Iterations: iterations,
-	}
+	}, nil
 }
 
 // VerifyPassword checks a password against _users-doc style fields,
 // supporting both the legacy sha1 scheme and pbkdf2:sha256.
 func VerifyPassword(password string, h *HashedPassword) bool {
+	if err := h.Validate(MinPasswordIterations, MaxPasswordIterations); err != nil {
+		return false
+	}
 	var computed string
 	switch h.Scheme {
 	case "pbkdf2":
@@ -55,14 +129,50 @@ func VerifyPassword(password string, h *HashedPassword) bool {
 
 // HashAdminPassword produces CouchDB's config-stored admin format.
 // "-pbkdf2:sha256-<derived_key>,<salt>,<iterations>". Already-hashed values
-// pass through unchanged.
+// pass through unchanged after validation.
+// Invalid input returns an empty value without performing password derivation.
+// Configuration request paths use HashAdminPasswordChecked to report the error.
 func HashAdminPassword(password string, iterations int) string {
-	if strings.HasPrefix(password, "-pbkdf2") || strings.HasPrefix(password, "-hashed-") {
-		return password
+	stored, _ := HashAdminPasswordChecked(password, iterations)
+	return stored
+}
+
+func HashAdminPasswordChecked(password string, iterations int) (string, error) {
+	if strings.HasPrefix(password, "-pbkdf2") {
+		if _, ok := ParseAdminPassword(password); !ok {
+			return "", fmt.Errorf("%w: malformed administrator hash", ErrInvalidPasswordHash)
+		}
+		return password, nil
 	}
-	h := HashUserPassword(password, iterations)
+	// CouchDB's deprecated single-SHA1 administrator hashes have no attacker-
+	// controlled work factor. Preserve the existing pass-through behavior.
+	if strings.HasPrefix(password, "-hashed-") {
+		if !validLegacyAdminPassword(password) {
+			return "", fmt.Errorf("%w: malformed legacy administrator hash", ErrInvalidPasswordHash)
+		}
+		return password, nil
+	}
+	h, err := HashUserPasswordChecked(password, iterations)
+	if err != nil {
+		return "", err
+	}
 	return "-pbkdf2:sha256-" + h.DerivedKey + "," + h.Salt + "," +
-		strconv.Itoa(h.Iterations)
+		strconv.Itoa(h.Iterations), nil
+}
+
+func validLegacyAdminPassword(stored string) bool {
+	rest, ok := strings.CutPrefix(stored, "-hashed-")
+	if !ok {
+		return false
+	}
+	derived, salt, ok := strings.Cut(rest, ",")
+	if !ok || strings.ContainsRune(salt, ',') ||
+		len(derived) != hex.EncodedLen(sha1.Size) ||
+		salt == "" || len(salt) > maxPasswordSaltBytes {
+		return false
+	}
+	_, err := hex.DecodeString(derived)
+	return err == nil
 }
 
 // ParseAdminPassword reads a stored admin value. It accepts the sha256 form above or
@@ -85,12 +195,16 @@ func ParseAdminPassword(stored string) (*HashedPassword, bool) {
 	if err != nil {
 		return nil, false
 	}
-	return &HashedPassword{
+	h := &HashedPassword{
 		Scheme:     scheme,
 		DerivedKey: parts[0],
 		Salt:       parts[1],
 		Iterations: iterations,
-	}, true
+	}
+	if err := h.Validate(MinPasswordIterations, MaxPasswordIterations); err != nil {
+		return nil, false
+	}
+	return h, true
 }
 
 func VerifyAdminPassword(password, stored string) bool {

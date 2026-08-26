@@ -1,19 +1,25 @@
 package couch
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestAdminPasswordRoundTrip(t *testing.T) {
-	stored := HashAdminPassword("s3cret", 10)
+	stored, err := HashAdminPasswordChecked("s3cret", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !VerifyAdminPassword("s3cret", stored) {
 		t.Fatal("correct password rejected")
 	}
 	if VerifyAdminPassword("wrong", stored) {
 		t.Fatal("wrong password accepted")
 	}
-	if HashAdminPassword(stored, 10) != stored {
+	passthrough, err := HashAdminPasswordChecked(stored, 10)
+	if err != nil || passthrough != stored {
 		t.Fatal("already-hashed value must pass through")
 	}
 }
@@ -31,7 +37,10 @@ func TestLegacySHA1Verify(t *testing.T) {
 }
 
 func TestUserPasswordHashing(t *testing.T) {
-	h := HashUserPassword("hunter2", 10)
+	h, err := HashUserPasswordChecked("hunter2", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if h.Scheme != "pbkdf2:sha256" {
 		t.Fatalf("scheme: %s", h.Scheme)
 	}
@@ -125,41 +134,51 @@ func TestValidateUserDoc(t *testing.T) {
 		return map[string]any{"type": "user", "name": name, "roles": roles}
 	}
 
-	if err := ValidateUserDoc("org.couchdb.user:bob", doc("bob", "staff"), nil, false, admin); err != nil {
+	if err := ValidateUserDoc("org.couchdb.user:bob", doc("bob", "staff"), nil, false,
+		admin, MinPasswordIterations, MaxPasswordIterations); err != nil {
 		t.Fatalf("admin create: %v", err)
 	}
-	if err := ValidateUserDoc("org.couchdb.user:alice", doc("bob"), nil, false, admin); err == nil {
+	if err := ValidateUserDoc("org.couchdb.user:alice", doc("bob"), nil, false,
+		admin, MinPasswordIterations, MaxPasswordIterations); err == nil {
 		t.Fatal("docid/name mismatch accepted")
 	}
 	badType := doc("bob")
 	badType["type"] = "person"
-	if err := ValidateUserDoc("org.couchdb.user:bob", badType, nil, false, admin); err == nil {
+	if err := ValidateUserDoc("org.couchdb.user:bob", badType, nil, false,
+		admin, MinPasswordIterations, MaxPasswordIterations); err == nil {
 		t.Fatal("wrong type accepted")
 	}
-	if err := ValidateUserDoc("org.couchdb.user:bob", doc("bob", "_admin"), nil, false, admin); err == nil {
+	if err := ValidateUserDoc("org.couchdb.user:bob", doc("bob", "_admin"), nil, false,
+		admin, MinPasswordIterations, MaxPasswordIterations); err == nil {
 		t.Fatal("system role accepted")
 	}
 
 	// Non-admin rules.
-	if err := ValidateUserDoc("org.couchdb.user:bob", doc("bob"), nil, false, bob); err != nil {
+	if err := ValidateUserDoc("org.couchdb.user:bob", doc("bob"), nil, false,
+		bob, MinPasswordIterations, MaxPasswordIterations); err != nil {
 		t.Fatalf("self signup: %v", err)
 	}
-	err := ValidateUserDoc("org.couchdb.user:bob", doc("bob", "staff"), nil, false, bob)
+	err := ValidateUserDoc("org.couchdb.user:bob", doc("bob", "staff"), nil, false,
+		bob, MinPasswordIterations, MaxPasswordIterations)
 	if ce, _ := err.(*Error); ce == nil || ce.Reason != "Only _admin may set roles" {
 		t.Fatalf("role grant on create: %v", err)
 	}
-	err = ValidateUserDoc("org.couchdb.user:alice", doc("alice"), nil, false, bob)
+	err = ValidateUserDoc("org.couchdb.user:alice", doc("alice"), nil, false,
+		bob, MinPasswordIterations, MaxPasswordIterations)
 	if ce, _ := err.(*Error); ce == nil || ce.Reason != "You may only update your own user document." {
 		t.Fatalf("foreign doc: %v", err)
 	}
-	err = ValidateUserDoc("org.couchdb.user:bob", doc("bob", "staff"), doc("bob"), false, bob)
+	err = ValidateUserDoc("org.couchdb.user:bob", doc("bob", "staff"), doc("bob"), false,
+		bob, MinPasswordIterations, MaxPasswordIterations)
 	if ce, _ := err.(*Error); ce == nil || ce.Reason != "Only _admin may edit roles" {
 		t.Fatalf("role escalation: %v", err)
 	}
-	if err := ValidateUserDoc("org.couchdb.user:bob", nil, doc("bob"), true, bob); err != nil {
+	if err := ValidateUserDoc("org.couchdb.user:bob", nil, doc("bob"), true,
+		bob, MinPasswordIterations, MaxPasswordIterations); err != nil {
 		t.Fatalf("self delete: %v", err)
 	}
-	if err := ValidateUserDoc("org.couchdb.user:alice", nil, doc("alice"), true, bob); err == nil {
+	if err := ValidateUserDoc("org.couchdb.user:alice", nil, doc("alice"), true,
+		bob, MinPasswordIterations, MaxPasswordIterations); err == nil {
 		t.Fatal("foreign delete accepted")
 	}
 }
@@ -167,7 +186,9 @@ func TestValidateUserDoc(t *testing.T) {
 func TestPrepareUserDoc(t *testing.T) {
 	body := map[string]any{"type": "user", "name": "bob", "roles": []any{},
 		"password": "hunter2"}
-	PrepareUserDoc(body, 10)
+	if err := PrepareUserDoc(body, 10); err != nil {
+		t.Fatal(err)
+	}
 	if _, still := body["password"]; still {
 		t.Fatal("plaintext password kept")
 	}
@@ -177,5 +198,91 @@ func TestPrepareUserDoc(t *testing.T) {
 	}
 	if !VerifyPassword("hunter2", record.Password) {
 		t.Fatal("hashed password does not verify")
+	}
+}
+
+func TestPasswordHashValidation(t *testing.T) {
+	valid, err := HashUserPasswordChecked("hunter2", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := valid.Validate(1, 100); err != nil {
+		t.Fatalf("valid hash rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		hash HashedPassword
+	}{
+		{"unknown scheme", HashedPassword{"bcrypt", valid.DerivedKey, valid.Salt, 10}},
+		{"zero iterations", HashedPassword{valid.Scheme, valid.DerivedKey, valid.Salt, 0}},
+		{"excessive iterations", HashedPassword{valid.Scheme, valid.DerivedKey, valid.Salt, MaxPasswordIterations + 1}},
+		{"short key", HashedPassword{valid.Scheme, "00", valid.Salt, 10}},
+		{"non-hex key", HashedPassword{valid.Scheme, strings.Repeat("z", 64), valid.Salt, 10}},
+		{"empty salt", HashedPassword{valid.Scheme, valid.DerivedKey, "", 10}},
+		{"oversized salt", HashedPassword{valid.Scheme, valid.DerivedKey, strings.Repeat("s", maxPasswordSaltBytes+1), 10}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.hash.Validate(MinPasswordIterations, MaxPasswordIterations); err == nil {
+				t.Fatal("invalid hash accepted")
+			}
+			if VerifyPassword("hunter2", &tc.hash) {
+				t.Fatal("invalid hash verified")
+			}
+		})
+	}
+
+	if _, err := HashUserPasswordChecked("pw", MaxPasswordIterations+1); err == nil {
+		t.Fatal("unsafe hashing work factor accepted")
+	}
+	if got := HashUserPassword("pw", MaxPasswordIterations+1); got != (HashedPassword{}) {
+		t.Fatal("unchecked hashing API did not fail closed")
+	}
+	badAdmin := "-pbkdf2:sha256-" + valid.DerivedKey + "," + valid.Salt + "," +
+		strconv.Itoa(MaxPasswordIterations+1)
+	if _, ok := ParseAdminPassword(badAdmin); ok {
+		t.Fatal("unsafe administrator hash accepted")
+	}
+	if _, err := HashAdminPasswordChecked(badAdmin, 10); err == nil {
+		t.Fatal("unsafe administrator hash passed through")
+	}
+	if got := HashAdminPassword(badAdmin, 10); got != "" {
+		t.Fatal("unchecked administrator hashing API did not fail closed")
+	}
+	if _, err := HashAdminPasswordChecked("-hashed-not-a-valid-hash", 10); err == nil {
+		t.Fatal("malformed legacy administrator hash passed through")
+	}
+}
+
+func TestValidateUserPasswordHash(t *testing.T) {
+	admin := &UserCtx{Name: "root", Roles: []string{"_admin"}}
+	base := func() map[string]any {
+		return map[string]any{"type": "user", "name": "bob", "roles": []any{}}
+	}
+	valid, err := HashUserPasswordChecked("pw", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doc := base()
+	doc["password_scheme"] = valid.Scheme
+	doc["derived_key"] = valid.DerivedKey
+	doc["salt"] = valid.Salt
+	doc["iterations"] = MaxPasswordIterations + 1
+	if err := ValidateUserDoc(UserDocPrefix+"bob", doc, nil, false, admin,
+		MinPasswordIterations, MaxPasswordIterations); err == nil {
+		t.Fatal("excessive user work factor accepted")
+	}
+	record, ok := UserRecordFromDoc(doc)
+	if !ok || record.Password != nil {
+		t.Fatalf("unsafe stored record became authenticatable: %+v", record)
+	}
+
+	// A plaintext password wins over stale hash members and is safely replaced.
+	doc["password"] = "new-password"
+	if err := ValidateUserDoc(UserDocPrefix+"bob", doc, nil, false, admin,
+		MinPasswordIterations, MaxPasswordIterations); err != nil {
+		t.Fatalf("plaintext replacement rejected: %v", err)
 	}
 }
