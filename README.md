@@ -23,8 +23,8 @@ couchgres is a CouchDB compatible HTTP API server written in Go and backed by Po
 
 ## Prerequisites
 
-- Go 1.26+
-- PostgreSQL 17+
+- Go 1.26.7+
+- PostgreSQL 18+
 - curl (to fetch Fauxton)
 - Elixir 1.19+ (optional; only required for running compatibility checks)
 
@@ -155,6 +155,7 @@ Most remaining failures also fail on CouchDB outside of a full developer setup, 
 ```sh
 createdb couchgres_test
 make test
+make vulncheck
 
 # Side by side response comparison against CouchDB 3.5.
 make fauxton && go run ./cmd/couchgres &
