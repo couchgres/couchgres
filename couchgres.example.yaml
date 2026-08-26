@@ -2,6 +2,14 @@
 bind: 127.0.0.1
 port: 5984
 
+# Slow-client and oversized-header protection
+http:
+  read_header_timeout: 10s
+  read_timeout: 60s
+  write_timeout: 5m
+  idle_timeout: 2m
+  max_header_bytes: 65536
+
 # PostgreSQL Configuration
 postgres:
   url: postgres://localhost/couchgres

@@ -18,23 +18,25 @@ import (
 const couchDBVersion = "3.5.0"
 
 type Server struct {
-	store           *store.Store
-	config          *configCache
-	broker          *store.Broker
-	scheduler       *replicate.Scheduler
-	lifetime        context.Context
-	handler         http.Handler
-	serverUUID      string
-	maxUUIDCount    int
-	credentialCache *credentialCache
-	passwordAuth    *passwordAuthenticator
-	js              *jsengine.Pool
-	mapper          jsMapper
-	reducer         jsReducer
-	vdu             *vduCache
-	viewCache       *viewRespCache
-	startedAt       time.Time
-	replicatorOnce  sync.Once
+	store              *store.Store
+	config             *configCache
+	broker             *store.Broker
+	scheduler          *replicate.Scheduler
+	lifetime           context.Context
+	handler            http.Handler
+	serverUUID         string
+	maxUUIDCount       int
+	credentialCache    *credentialCache
+	passwordAuth       *passwordAuthenticator
+	bodyLimiter        *requestBodyLimiter
+	js                 *jsengine.Pool
+	mapper             jsMapper
+	reducer            jsReducer
+	vdu                *vduCache
+	viewCache          *viewRespCache
+	startedAt          time.Time
+	streamWriteTimeout time.Duration
+	replicatorOnce     sync.Once
 
 	// UUID generation state (config uuids/algorithm).
 	uuidMu         sync.Mutex
@@ -53,6 +55,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // self-minted admin session).
 func (s *Server) SetSelfURL(base string) {
 	s.scheduler.SetSelf(base, s.mintAdminCookie)
+}
+
+// SetStreamWriteTimeout keeps active streaming responses on a rolling write
+// deadline while preserving the listener's slow-reader protection.
+func (s *Server) SetStreamWriteTimeout(timeout time.Duration) {
+	if timeout > 0 {
+		s.streamWriteTimeout = timeout
+	}
 }
 
 // mintAdminCookie issues a session for the first configured admin.
@@ -83,18 +93,20 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 		return nil, err
 	}
 	s := &Server{
-		store:           st,
-		config:          config,
-		broker:          st.StartBroker(ctx),
-		lifetime:        ctx,
-		serverUUID:      serverUUID,
-		maxUUIDCount:    1000,
-		credentialCache: newCredentialCache(),
-		passwordAuth:    newPasswordAuthenticator(),
-		js:              jsengine.NewPool(0, 5*time.Second),
-		vdu:             newVDUCache(),
-		viewCache:       newViewRespCache(),
-		startedAt:       time.Now(),
+		store:              st,
+		config:             config,
+		broker:             st.StartBroker(ctx),
+		lifetime:           ctx,
+		serverUUID:         serverUUID,
+		maxUUIDCount:       1000,
+		credentialCache:    newCredentialCache(),
+		passwordAuth:       newPasswordAuthenticator(),
+		bodyLimiter:        newRequestBodyLimiter(),
+		js:                 jsengine.NewPool(0, 5*time.Second),
+		vdu:                newVDUCache(),
+		viewCache:          newViewRespCache(),
+		startedAt:          time.Now(),
+		streamWriteTimeout: 5 * time.Minute,
 	}
 	s.mapper = jsMapper{pool: s.js}
 	s.reducer = jsReducer{pool: s.js}
@@ -258,15 +270,6 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 	// patterns can't express next to /{db} routes. Branch before the mux.
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.decodePlusToSpace(r)
-		// chttpd/max_http_request_size (default 4 GiB). Enforce on the
-		// actual body bytes. Content-Length alone is bypassable via
-		// chunked transfer or an understated/missing length.
-		maxSize := int64(s.config.getInt("chttpd", "max_http_request_size", 4294967296))
-		if r.ContentLength > maxSize {
-			writeError(w, couch.NewError(413, "too_large", "the request entity is too large"))
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxSize)
 		// X-HTTP-Method-Override lets broken clients fake PUT/DELETE
 		// through POST (never any other original method).
 		if r.Method == http.MethodPost {
@@ -275,6 +278,12 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 				r.Method = strings.ToUpper(override)
 			}
 		}
+		_, pattern := mux.Handler(r)
+		release, ok := s.protectRequestBody(w, r, pattern)
+		if !ok {
+			return
+		}
+		defer release()
 		if r.URL.Path == "/_utils" || strings.HasPrefix(r.URL.Path, "/_utils/") {
 			h(s.utils).ServeHTTP(w, r)
 			return

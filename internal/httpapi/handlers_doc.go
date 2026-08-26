@@ -1052,9 +1052,15 @@ func (s *Server) formDataUpdate(w http.ResponseWriter, r *http.Request, dbName, 
 	if err := s.authorizeDocWrite(r, db, docid); err != nil {
 		return err
 	}
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
+	// Keep only a small prefix in memory. MaxBytesReader enforces the
+	// route's full request and temporary-disk budget.
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		if r.MultipartForm != nil {
+			r.MultipartForm.RemoveAll()
+		}
 		return mapBodyReadErr(err, "invalid multipart/form-data body")
 	}
+	defer r.MultipartForm.RemoveAll()
 	revStr := r.FormValue("_rev")
 	rev, err := couch.ParseRev(revStr)
 	if err != nil {

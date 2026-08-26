@@ -392,6 +392,7 @@ func (s *Server) changesStream(w http.ResponseWriter, r *http.Request, db *store
 		w.Header().Set("Content-Type", "application/json")
 	}
 	w.Header().Set("Cache-Control", "must-revalidate")
+	s.refreshStreamWriteDeadline(w)
 	w.WriteHeader(200)
 	// Clients (EventSource especially) need the headers before the first
 	// change or heartbeat shows up.
@@ -410,8 +411,10 @@ func (s *Server) changesStream(w http.ResponseWriter, r *http.Request, db *store
 			return err
 		}
 		if eventsource {
+			s.refreshStreamWriteDeadline(w)
 			_, err = w.Write([]byte("data: " + row + "\nid: " + strconv.FormatInt(c.Seq, 10) + "\n\n"))
 		} else {
+			s.refreshStreamWriteDeadline(w)
 			_, err = w.Write([]byte(row + "\n"))
 		}
 		return err
@@ -483,6 +486,7 @@ func (s *Server) changesStream(w http.ResponseWriter, r *http.Request, db *store
 			if eventsource {
 				beat = "event: heartbeat\ndata: \n\n"
 			}
+			s.refreshStreamWriteDeadline(w)
 			if _, err := w.Write([]byte(beat)); err != nil {
 				return nil
 			}
@@ -494,6 +498,11 @@ func (s *Server) changesStream(w http.ResponseWriter, r *http.Request, db *store
 			return nil
 		}
 	}
+}
+
+func (s *Server) refreshStreamWriteDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(
+		time.Now().Add(s.streamWriteTimeout))
 }
 
 func finishStream(w http.ResponseWriter, eventsource bool, lastSeq int64) {

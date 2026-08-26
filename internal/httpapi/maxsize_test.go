@@ -60,6 +60,22 @@ func TestMaxHTTPRequestSize(t *testing.T) {
 	})
 }
 
+func TestRequestSizeConfigRejectsUnsafeValues(t *testing.T) {
+	h := testHandler(t)
+	admin := adminAuth()
+	for _, path := range []string{
+		"/_node/_local/_config/chttpd/max_http_request_size",
+		"/_node/_local/_config/couchgres_httpd/max_attachment_request_size",
+	} {
+		for _, value := range []string{"0", "-1", "268435457", "invalid"} {
+			resp := send(t, h, "PUT", path, value, testAdminAuth, admin)
+			if resp.status != http.StatusBadRequest {
+				t.Errorf("%s=%s: status=%d body=%+v", path, value, resp.status, resp.body)
+			}
+		}
+	}
+}
+
 func assertTooLarge(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	if rec.Code != 413 {

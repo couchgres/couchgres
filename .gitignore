@@ -2,6 +2,6 @@
 *.log
 couchgres.yaml
 !couchgres.example.yaml
-couchgres
+/couchgres
 internal/fauxton/dist/
 internal/fauxton/LICENSE

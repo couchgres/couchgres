@@ -53,6 +53,9 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) error {
 		return couch.BadRequest("Config value must be a JSON string")
 	}
 	section, key := r.PathValue("section"), r.PathValue("key")
+	if err := validateRequestBodySizeChange(section, key, value); err != nil {
+		return couch.BadRequest(err.Error())
+	}
 	if section == "couch_httpd_auth" &&
 		(key == "iterations" || key == "min_iterations" || key == "max_iterations") {
 		if err := s.config.validatePasswordIterationChange(key, value); err != nil {

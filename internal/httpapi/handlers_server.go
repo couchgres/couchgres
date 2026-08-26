@@ -261,7 +261,7 @@ func readHTTPBody(r *http.Request) ([]byte, error) {
 func mapBodyReadErr(err error, fallback string) error {
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
-		return couch.NewError(413, "too_large", "the request entity is too large")
+		return requestTooLarge()
 	}
 	return couch.BadRequest(fallback)
 }
