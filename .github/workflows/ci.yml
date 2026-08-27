@@ -19,16 +19,16 @@ jobs:
           test "$(go env GOVERSION)" = "go1.26.7"
           go version
 
-      - name: Install PostgreSQL 17
+      - name: Install PostgreSQL 18
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -p -y
-          sudo apt-get install -y postgresql-17
-          # The runner image ships an older cluster on 5432; replace it with 17.
-          for v in 14 15 16 17; do sudo pg_dropcluster --stop $v main 2>/dev/null || true; done
-          sudo pg_createcluster 17 main --port 5432 -- --auth-local trust --auth-host trust
-          sudo systemctl start postgresql@17-main
+          sudo apt-get install -y postgresql-18
+          # The runner image ships an older cluster on 5432; replace it with 18.
+          for v in 14 15 16 17 18; do sudo pg_dropcluster --stop $v main 2>/dev/null || true; done
+          sudo pg_createcluster 18 main --port 5432 -- --auth-local trust --auth-host trust
+          sudo systemctl start postgresql@18-main
           sudo -u postgres createuser --superuser "$USER"
           createdb couchgres_test
           createdb couchgres

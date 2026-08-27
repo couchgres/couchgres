@@ -111,24 +111,24 @@ in `GET /_node/_local/_stats`.
 
 ### Overview
 
-Results from `compat/perf` on an Apple M3 with 24 GB RAM, macOS, PostgreSQL 17, CouchDB 3.5.2, default package settings, and 50,000 documents of ~200 bytes each.
+Median results from three `compat/perf` runs on an Apple M3 with 24 GB RAM, macOS, PostgreSQL 18.4, CouchDB 3.5.2, default server settings, and 50,000 documents of ~200 bytes each.
 
-| Workload                                             | couchgres              | CouchDB 3.5.2       |
-| ---------------------------------------------------- | ---------------------- | ------------------- |
-| Bulk insert (`_bulk_docs`, 500-document batches)     | 23,600 docs/sec        | **45,000 docs/sec** |
-| Single-document PUT, 1 client                        | **3,350 writes/sec**   | 1,580 writes/sec    |
-| Single-document PUT, 16 clients                      | **10,700 writes/sec**  | 4,430 writes/sec    |
-| Single-document GET, 1 client                        | **10,100 reads/sec**   | 3,400 reads/sec     |
-| Single-document GET, 16 clients                      | **27,400 reads/sec**   | 14,800 reads/sec    |
-| `_bulk_get`, 100 documents per request               | **116,000 docs/sec**   | 25,900 docs/sec     |
-| Attachment PUT, 100KB text                           | **1,640 atts/sec**     | 750 atts/sec        |
-| Attachment GET, 100KB text                           | **6,230 reads/sec**    | 2,800 reads/sec     |
-| `_all_docs?include_docs=true`, full 55,000-row scan  | **211,000 rows/sec**   | 53,200 rows/sec     |
-| View build, JavaScript map on first query after load | **61,000 docs/sec**    | 46,800 docs/sec     |
-| Warm view query, `key=N&limit=20`                    | **6,990 queries/sec**  | 2,130 queries/sec   |
-| Warm view query, 16 clients                          | **34,800 queries/sec** | 8,330 queries/sec   |
-| `_find` with a two field index and limit 25          | 430 queries/sec        | **500 queries/sec** |
-| `_changes`, full read                                | **540,000 rows/sec**   | 107,000 rows/sec    |
+| Workload                                             | couchgres + PostgreSQL 18.4 | CouchDB 3.5.2       | couchgres vs CouchDB |
+| ---------------------------------------------------- | --------------------------- | ------------------- | -------------------: |
+| Bulk insert (`_bulk_docs`, 500-document batches)     | 30,251 docs/sec             | **43,035 docs/sec** |               -29.7% |
+| Single-document PUT, 1 client                        | **4,681 writes/sec**        | 1,441 writes/sec    |              +224.8% |
+| Single-document PUT, 16 clients                      | **7,689 writes/sec**        | 4,374 writes/sec    |               +75.8% |
+| Single-document GET, 1 client                        | **12,117 reads/sec**        | 3,762 reads/sec     |              +222.1% |
+| Single-document GET, 16 clients                      | **40,738 reads/sec**        | 14,509 reads/sec    |              +180.8% |
+| `_bulk_get`, 100 documents per request               | **114,691 docs/sec**        | 24,983 docs/sec     |              +359.1% |
+| Attachment PUT, 100KB text                           | **1,908 atts/sec**          | 764 atts/sec        |              +149.7% |
+| Attachment GET, 100KB text                           | **6,783 reads/sec**         | 2,893 reads/sec     |              +134.5% |
+| `_all_docs?include_docs=true`, full 55,200-row scan  | **159,671 rows/sec**        | 51,836 rows/sec     |              +208.0% |
+| View build, JavaScript map on first query after load | **60,478 docs/sec**         | 47,904 docs/sec     |               +26.2% |
+| Warm view query, `key=N&limit=20`                    | **2,129 queries/sec**       | 1,797 queries/sec   |               +18.5% |
+| Warm view query, 16 clients                          | **42,327 queries/sec**      | 7,678 queries/sec   |              +451.3% |
+| `_find` with a two field index and limit 25          | **1,912 queries/sec**       | 566 queries/sec     |              +237.8% |
+| `_changes`, full read                                | **724,040 rows/sec**        | 106,489 rows/sec    |              +579.9% |
 
 ### Running Benchmarks
 
