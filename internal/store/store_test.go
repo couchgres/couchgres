@@ -1,6 +1,6 @@
 package store
 
-// Integration tests require a reachable Postgres 17. They are skipped when the
+// Integration tests require a reachable Postgres 18. They are skipped when the
 // database is unavailable. Override with COUCHGRES_TEST_PG_URL.
 
 import (
@@ -786,52 +786,6 @@ func TestPendingAfterCachesCommittedGenerations(t *testing.T) {
 	}
 	if got := pendingCacheEntry(t, &s.pendingCounts, db.Schema, seq1, seq4, 1); got != 2 {
 		t.Fatalf("post-purge cache = %d", got)
-	}
-}
-
-func TestPendingAfterHandlesOutOfOrderCommits(t *testing.T) {
-	s := testStore(t)
-	ctx := t.Context()
-	db := freshDB(t, s, "it_pending_commit_order")
-
-	_, _, err := s.PutDoc(ctx, db, "one", body(t, `{"n":1}`), nil, nil, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, err = s.PutDoc(ctx, db, "two", body(t, `{"n":2}`), nil, nil, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rev3, seq3, err := s.PutDoc(ctx, db, "three", body(t, `{"n":3}`), nil, nil, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	slow, err := s.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer slow.Rollback(ctx)
-	if _, err := slow.Exec(ctx, fmt.Sprintf(
-		"UPDATE %s.docs SET seq = nextval('%s.update_seq') WHERE id = 'two'",
-		db.Schema, db.Schema)); err != nil {
-		t.Fatal(err)
-	}
-	_, seq5, err := s.PutDoc(ctx, db, "three", body(t, `{"n":5}`), nil, &rev3, false, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pending, err := s.PendingAfter(ctx, db, seq3); err != nil || pending != 1 {
-		t.Fatalf("pending before older commit = %d, %v", pending, err)
-	}
-	if err := slow.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if pending, err := s.PendingAfter(ctx, db, seq3); err != nil || pending != 2 {
-		t.Fatalf("pending after older commit = %d, %v", pending, err)
-	}
-	if seq5 <= seq3 {
-		t.Fatal("test setup did not advance the update sequence")
 	}
 }
 

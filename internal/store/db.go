@@ -67,8 +67,8 @@ func (s *Store) CreateDatabase(ctx context.Context, name string, partitioned boo
 	tag, err := tx.Exec(ctx,
 		`INSERT INTO couchgres.databases
 		   (name, schema_name, partitioned, instance_start_time,
-		    doc_counts_initialized)
-		 VALUES ($1, $2, $3, $4, true) ON CONFLICT (name) DO NOTHING`,
+		    doc_counts_initialized, update_seq_initialized)
+		 VALUES ($1, $2, $3, $4, true, true) ON CONFLICT (name) DO NOTHING`,
 		name, schema, partitioned, startTime,
 	)
 	if err != nil {
@@ -282,7 +282,8 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 	defer tx.Rollback(ctx)
 
 	query := `SELECT name, schema_name, partitioned, revs_limit,
-	                 instance_start_time, doc_count, doc_del_count, purge_seq
+	                 instance_start_time, doc_count, doc_del_count, purge_seq,
+	                 update_seq
 	          FROM couchgres.databases`
 	var args []any
 	if names != nil {
@@ -303,6 +304,7 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 			&item.DB.Name, &item.DB.Schema, &item.DB.Partitioned,
 			&item.DB.RevsLimit, &item.DB.InstanceStartTime,
 			&item.Info.DocCount, &item.Info.DocDelCount, &item.Info.PurgeSeq,
+			&item.Info.UpdateSeq,
 		); err != nil {
 			rows.Close()
 			return nil, err
@@ -327,8 +329,8 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 		}
 		for details.Next() {
 			var name string
-			var updateSeq, sizeBytes, externalSize int64
-			if err := details.Scan(&name, &updateSeq, &sizeBytes, &externalSize); err != nil {
+			var sizeBytes, externalSize int64
+			if err := details.Scan(&name, &sizeBytes, &externalSize); err != nil {
 				details.Close()
 				return nil, err
 			}
@@ -337,7 +339,6 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 				details.Close()
 				return nil, fmt.Errorf("database info returned unknown database %q", name)
 			}
-			infos[i].Info.UpdateSeq = updateSeq
 			infos[i].Info.SizeBytes = sizeBytes
 			infos[i].Info.ExternalSize = externalSize
 		}
@@ -361,7 +362,6 @@ func databaseInfoDetailsQuery(infos []DatabaseInfo) (string, []any) {
 		}
 		args[i] = item.DB.Name
 		fmt.Fprintf(&query, `SELECT $%d::text,
-		   (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM %[2]s.update_seq),
 		   pg_total_relation_size('%[2]s.docs')
 		     + pg_total_relation_size('%[2]s.revs')
 		     + pg_total_relation_size('%[2]s.attachments'),

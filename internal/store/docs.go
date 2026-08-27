@@ -371,8 +371,9 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 		}
 	}
 
-	// finishWrite uses set-based statements. It recomputes winners, refreshes
-	// the docs cache, assigns sequences in input order, and sends one notification.
+	// Finish the accepted IDs as one set. Reserving their range through the
+	// transactional registry counter serializes finalization with other writers:
+	// no higher sequence can commit before this transaction.
 	written := make([]string, 0, len(leafIDs))
 	wseen := make(map[string]bool, len(leafIDs))
 	for _, id := range leafIDs {
@@ -381,8 +382,17 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 			written = append(written, id)
 		}
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(
-		`WITH ordered AS (
+	if len(written) == 0 {
+		// An all-conflict batch made no changes. Avoid contending on the
+		// per-database cursor row or waking changes listeners.
+		return results, nil
+	}
+	tag, err := tx.Exec(ctx, fmt.Sprintf(
+		`WITH allocated AS (
+		   UPDATE couchgres.databases SET update_seq = update_seq + $2
+		   WHERE name = $3
+		   RETURNING update_seq - $2 + 1 AS first_seq
+		 ), ordered AS (
 		   SELECT t.id, t.ord FROM unnest($1::text[]) WITH ORDINALITY AS t(id, ord)
 		 ), w AS (
 		   SELECT DISTINCT ON (r.id) r.id, r.rev_num, r.rev_hash, r.deleted
@@ -391,15 +401,19 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 		   ORDER BY r.id, r.deleted ASC, r.rev_num DESC, r.rev_hash DESC
 		 )
 		 INSERT INTO %[1]s.docs (id, rev_num, rev_hash, deleted, seq)
-		 SELECT w.id, w.rev_num, w.rev_hash, w.deleted, nextval('%[1]s.update_seq')
-		 FROM w JOIN ordered o ON o.id = w.id
+		 SELECT w.id, w.rev_num, w.rev_hash, w.deleted, a.first_seq + o.ord - 1
+		 FROM w JOIN ordered o ON o.id = w.id CROSS JOIN allocated a
 		 ORDER BY o.ord
 		 ON CONFLICT (id) DO UPDATE SET rev_num = EXCLUDED.rev_num,
 		   rev_hash = EXCLUDED.rev_hash, deleted = EXCLUDED.deleted,
 		   seq = EXCLUDED.seq`, db.Schema),
-		written,
-	); err != nil {
+		written, int64(len(written)), db.Name,
+	)
+	if err != nil {
 		return nil, err
+	}
+	if tag.RowsAffected() != int64(len(written)) {
+		return nil, fmt.Errorf("database metadata missing for %q", db.Name)
 	}
 	if maxRevNum > db.RevsLimit {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(
@@ -615,7 +629,7 @@ func insertLeafRev(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.
 }
 
 // finishWrite recomputes the winner, refreshes the docs cache row, bumps the
-// sequence, prunes deep history, and notifies the changes broker.
+// committed update sequence, prunes deep history, and notifies the changes broker.
 func finishWrite(ctx context.Context, tx pgx.Tx, db *DB, id string) (int64, error) {
 	var winner struct {
 		num     int
@@ -634,18 +648,22 @@ func finishWrite(ctx context.Context, tx pgx.Tx, db *DB, id string) (int64, erro
 	}
 
 	var seq int64
-	if err := tx.QueryRow(ctx,
-		fmt.Sprintf("SELECT nextval('%s.update_seq')", db.Schema),
-	).Scan(&seq); err != nil {
-		return 0, err
+	err = tx.QueryRow(ctx, fmt.Sprintf(
+		`WITH allocated AS (
+		   UPDATE couchgres.databases SET update_seq = update_seq + 1
+		   WHERE name = $1 RETURNING update_seq
+		 )
+		 INSERT INTO %s.docs (id, rev_num, rev_hash, deleted, seq)
+		 SELECT $2, $3, $4, $5, update_seq FROM allocated
+		 ON CONFLICT (id) DO UPDATE SET rev_num = $3, rev_hash = $4,
+		   deleted = $5, seq = EXCLUDED.seq
+		 RETURNING seq`, db.Schema),
+		db.Name, id, winner.num, winner.hash, winner.deleted,
+	).Scan(&seq)
+	if err == pgx.ErrNoRows {
+		return 0, fmt.Errorf("database metadata missing for %q", db.Name)
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(
-		`INSERT INTO %s.docs (id, rev_num, rev_hash, deleted, seq)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (id) DO UPDATE SET rev_num = $2, rev_hash = $3,
-		   deleted = $4, seq = $5`, db.Schema),
-		id, winner.num, winner.hash, winner.deleted, seq,
-	); err != nil {
+	if err != nil {
 		return 0, err
 	}
 

@@ -21,7 +21,9 @@ ALTER TABLE couchgres.databases
     ADD COLUMN IF NOT EXISTS purged_infos_limit bigint NOT NULL DEFAULT 1000,
     ADD COLUMN IF NOT EXISTS doc_count bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS doc_del_count bigint NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS doc_counts_initialized boolean NOT NULL DEFAULT false;
+    ADD COLUMN IF NOT EXISTS doc_counts_initialized boolean NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS update_seq bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS update_seq_initialized boolean NOT NULL DEFAULT false;
 -- _all_dbs requires byte-order bounds and ordering regardless of the database's
 -- default collation. This expression index supports both scan directions.
 CREATE INDEX IF NOT EXISTS databases_name_c_idx
@@ -163,8 +165,6 @@ CREATE TABLE {s}.view_state (
     sig      text PRIMARY KEY,
     last_seq bigint NOT NULL DEFAULT 0
 );
-
-CREATE SEQUENCE {s}.update_seq;
 `
 
 func dbDDL(schema string) string {

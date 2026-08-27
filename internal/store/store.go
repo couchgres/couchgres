@@ -194,8 +194,8 @@ func (s *Store) Bootstrap(ctx context.Context) (string, error) {
 
 	// Databases created before docs_design_seq_idx existed get it here,
 	// ones from when docs still carried bodies lose the column (winner bodies
-	// live in revs), and databases from before transactional document counters
-	// receive a one-time backfill. New schemas already match.
+	// live in revs), and databases from before transactional update sequences or
+	// document counters receive a one-time backfill. New schemas already match.
 	rows, err := s.pool.Query(ctx, "SELECT schema_name FROM couchgres.databases")
 	if err != nil {
 		return "", err
@@ -213,6 +213,9 @@ func (s *Store) Bootstrap(ctx context.Context) (string, error) {
 		if _, err := s.pool.Exec(ctx, fmt.Sprintf(
 			"ALTER TABLE %s.docs DROP COLUMN IF EXISTS body", schema)); err != nil {
 			return "", fmt.Errorf("migrating %s: %w", schema, err)
+		}
+		if err := s.initializeUpdateSeq(ctx, schema); err != nil {
+			return "", fmt.Errorf("migrating update sequence for %s: %w", schema, err)
 		}
 		if err := s.initializeDocCounts(ctx, schema); err != nil {
 			return "", fmt.Errorf("migrating document counts for %s: %w", schema, err)
@@ -249,6 +252,90 @@ func (s *Store) Bootstrap(ctx context.Context) (string, error) {
 		}
 	}
 	return serverUUID, nil
+}
+
+// initializeUpdateSeq migrates a database from the old nontransactional
+// per-schema sequence to the committed counter in the database registry. The
+// registry-row lock serializes new writers and concurrent migrations. ALTER
+// fences legacy nextval callers before the sequence is sampled and dropped:
+// callers that already allocated finish first, while older binaries that reach
+// nextval afterward fail instead of silently bypassing the committed counter.
+// New databases set update_seq_initialized at creation and skip this path.
+func (s *Store) initializeUpdateSeq(ctx context.Context, schema string) error {
+	var initialized bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT update_seq_initialized FROM couchgres.databases
+		 WHERE schema_name = $1`, schema,
+	).Scan(&initialized)
+	if err == pgx.ErrNoRows || initialized {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var current int64
+	err = tx.QueryRow(ctx,
+		`SELECT update_seq, update_seq_initialized
+		 FROM couchgres.databases WHERE schema_name = $1 FOR UPDATE`, schema,
+	).Scan(&current, &initialized)
+	if err == pgx.ErrNoRows || initialized {
+		return tx.Rollback(ctx)
+	}
+	if err != nil {
+		return err
+	}
+
+	legacy := int64(0)
+	var hasLegacy bool
+	if err := tx.QueryRow(ctx,
+		"SELECT to_regclass($1) IS NOT NULL", schema+".update_seq",
+	).Scan(&hasLegacy); err != nil {
+		return err
+	}
+	if hasLegacy {
+		// ALTER SEQUENCE conflicts with nextval's lock and holds that fence until
+		// commit. CACHE 1 is the legacy DDL default, so this is semantically a
+		// no-op apart from acquiring the lock.
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			"ALTER SEQUENCE %s.update_seq CACHE 1", schema)); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, fmt.Sprintf(
+			"SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM %s.update_seq", schema),
+		).Scan(&legacy); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			"DROP SEQUENCE %s.update_seq", schema)); err != nil {
+			return err
+		}
+	}
+
+	// A current writer that touched document rows but has not reached its
+	// registry update is blocked behind our row lock. Its eventual increment is
+	// therefore greater than this watermark. A legacy writer either completed
+	// before ALTER acquired its lock or will fail at nextval after commit.
+	var visible int64
+	if err := tx.QueryRow(ctx, fmt.Sprintf(
+		"SELECT coalesce(max(seq), 0) FROM %s.docs", schema),
+	).Scan(&visible); err != nil {
+		return err
+	}
+	current = max(current, visible, legacy)
+	if _, err := tx.Exec(ctx,
+		`UPDATE couchgres.databases
+		 SET update_seq = $1, update_seq_initialized = true
+		 WHERE schema_name = $2`, current, schema); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // initializeDocCounts installs counter triggers and backfills databases created

@@ -287,8 +287,8 @@ func (s *Store) AllDocsKeys(
 
 func (s *Store) CurrentSeq(ctx context.Context, db *DB) (int64, error) {
 	var seq int64
-	err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		"SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM %s.update_seq", db.Schema),
+	err := s.pool.QueryRow(ctx,
+		"SELECT update_seq FROM couchgres.databases WHERE name = $1", db.Name,
 	).Scan(&seq)
 	return seq, err
 }
