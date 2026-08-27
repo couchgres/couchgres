@@ -335,7 +335,7 @@ func TestServerEndpoints(t *testing.T) {
 		t.Fatalf("_users missing from _all_dbs: %v", resp.array)
 	}
 
-	resp = send(t, h, "POST", "/_dbs_info", decode(t, `{"keys":["_users","nope"]}`), testAdminAuth, adminAuth())
+	resp = send(t, h, "POST", "/_dbs_info", decode(t, `{"keys":["_users","nope",42,"bad\u0000name","_users"]}`), testAdminAuth, adminAuth())
 	if resp.status != 200 {
 		t.Fatalf("_dbs_info: %+v", resp)
 	}
@@ -345,6 +345,34 @@ func TestServerEndpoints(t *testing.T) {
 	}
 	if resp.array[1].(map[string]any)["error"] != "not_found" {
 		t.Fatalf("_dbs_info second: %+v", resp.array[1])
+	}
+	if resp.array[2].(map[string]any)["error"] != "not_found" {
+		t.Fatalf("_dbs_info non-string: %+v", resp.array[2])
+	}
+	if resp.array[3].(map[string]any)["error"] != "not_found" {
+		t.Fatalf("_dbs_info invalid name: %+v", resp.array[3])
+	}
+	last := resp.array[4].(map[string]any)
+	if last["info"].(map[string]any)["db_name"] != "_users" {
+		t.Fatalf("_dbs_info duplicate: %+v", last)
+	}
+
+	resp = send(t, h, "GET", "/_dbs_info", nil, testAdminAuth, adminAuth())
+	if resp.status != 200 {
+		t.Fatalf("GET _dbs_info: %+v", resp)
+	}
+	foundUsers = false
+	for _, raw := range resp.array {
+		info := raw.(map[string]any)
+		if info["db_name"] == "_users" {
+			foundUsers = true
+			if _, ok := info["sizes"].(map[string]any)["external"]; !ok {
+				t.Fatalf("GET _dbs_info sizes: %+v", info)
+			}
+		}
+	}
+	if !foundUsers {
+		t.Fatalf("_users missing from GET _dbs_info: %+v", resp.array)
 	}
 
 	resp = send(t, h, "GET", "/_up", nil)

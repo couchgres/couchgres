@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -35,10 +36,19 @@ func validateDBUse(name string) error {
 
 // Info holds the numbers behind GET /{db}.
 type Info struct {
-	DocCount    int64
-	DocDelCount int64
-	UpdateSeq   int64
-	SizeBytes   int64
+	DocCount     int64
+	DocDelCount  int64
+	UpdateSeq    int64
+	PurgeSeq     int64
+	SizeBytes    int64
+	ExternalSize int64
+}
+
+// DatabaseInfo combines a registry row with the mutable and calculated values
+// used by GET /{db} and /_dbs_info.
+type DatabaseInfo struct {
+	DB   DB
+	Info Info
 }
 
 func (s *Store) CreateDatabase(ctx context.Context, name string, partitioned bool) error {
@@ -178,21 +188,140 @@ func (s *Store) ListDatabases(ctx context.Context) ([]string, error) {
 }
 
 func (s *Store) DBInfo(ctx context.Context, db *DB) (*Info, error) {
-	info := &Info{}
-	err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT
-		   m.doc_count,
-		   m.doc_del_count,
-		   (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM %[1]s.update_seq),
-		   pg_total_relation_size('%[1]s.docs')
-		   + pg_total_relation_size('%[1]s.revs')
-		   + pg_total_relation_size('%[1]s.attachments')
-		 FROM couchgres.databases m WHERE m.name = $1`, db.Schema), db.Name,
-	).Scan(&info.DocCount, &info.DocDelCount, &info.UpdateSeq, &info.SizeBytes)
+	infos, err := s.DatabaseInfos(ctx, []string{db.Name})
 	if err != nil {
 		return nil, err
 	}
-	return info, nil
+	if len(infos) == 0 {
+		return nil, couch.DBNotFound()
+	}
+	info := infos[0].Info
+	return &info, nil
+}
+
+const databaseInfoBatchSize = 128
+
+// DatabaseInfos returns database information in database-name byte order. A nil
+// names slice selects every database; a non-nil slice selects the existing,
+// unique names it contains. Registry lookup is one query, and calculated values
+// are fetched in bounded UNION ALL batches instead of several round trips per
+// database.
+func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseInfo, error) {
+	if names != nil {
+		valid := make([]string, 0, len(names))
+		seen := make(map[string]bool, len(names))
+		for _, name := range names {
+			if seen[name] || validateDBUse(name) != nil {
+				continue
+			}
+			seen[name] = true
+			valid = append(valid, name)
+		}
+		if len(valid) == 0 {
+			return []DatabaseInfo{}, nil
+		}
+		names = valid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	query := `SELECT name, schema_name, partitioned, revs_limit,
+	                 instance_start_time, doc_count, doc_del_count, purge_seq
+	          FROM couchgres.databases`
+	var args []any
+	if names != nil {
+		query += " WHERE name = ANY($1)"
+		args = append(args, names)
+	}
+	// Keep schemas alive while the dynamic detail query resolves their
+	// relations. KEY SHARE still permits normal count/purge metadata updates.
+	query += ` ORDER BY name COLLATE "C" FOR KEY SHARE`
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]DatabaseInfo, 0)
+	for rows.Next() {
+		var item DatabaseInfo
+		if err := rows.Scan(
+			&item.DB.Name, &item.DB.Schema, &item.DB.Partitioned,
+			&item.DB.RevsLimit, &item.DB.InstanceStartTime,
+			&item.Info.DocCount, &item.Info.DocDelCount, &item.Info.PurgeSeq,
+		); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		infos = append(infos, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	byName := make(map[string]int, len(infos))
+	for i := range infos {
+		byName[infos[i].DB.Name] = i
+	}
+	for start := 0; start < len(infos); start += databaseInfoBatchSize {
+		end := min(start+databaseInfoBatchSize, len(infos))
+		detailQuery, detailArgs := databaseInfoDetailsQuery(infos[start:end])
+		details, err := tx.Query(ctx, detailQuery, detailArgs...)
+		if err != nil {
+			return nil, err
+		}
+		for details.Next() {
+			var name string
+			var updateSeq, sizeBytes, externalSize int64
+			if err := details.Scan(&name, &updateSeq, &sizeBytes, &externalSize); err != nil {
+				details.Close()
+				return nil, err
+			}
+			i, ok := byName[name]
+			if !ok {
+				details.Close()
+				return nil, fmt.Errorf("database info returned unknown database %q", name)
+			}
+			infos[i].Info.UpdateSeq = updateSeq
+			infos[i].Info.SizeBytes = sizeBytes
+			infos[i].Info.ExternalSize = externalSize
+		}
+		details.Close()
+		if err := details.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return infos, nil
+}
+
+func databaseInfoDetailsQuery(infos []DatabaseInfo) (string, []any) {
+	var query strings.Builder
+	args := make([]any, len(infos))
+	for i, item := range infos {
+		if i > 0 {
+			query.WriteString(" UNION ALL ")
+		}
+		args[i] = item.DB.Name
+		fmt.Fprintf(&query, `SELECT $%d::text,
+		   (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM %[2]s.update_seq),
+		   pg_total_relation_size('%[2]s.docs')
+		     + pg_total_relation_size('%[2]s.revs')
+		     + pg_total_relation_size('%[2]s.attachments'),
+		   (SELECT coalesce(sum(length(%[3]s::text)), 0)
+		      FROM %[2]s.docs d %[4]s WHERE NOT d.deleted)
+		     + (SELECT coalesce(sum(a.length), 0)
+		          FROM %[2]s.attachments a
+		          JOIN %[2]s.docs d ON a.doc_id = d.id
+		            AND a.rev_num = d.rev_num AND a.rev_hash = d.rev_hash
+		         WHERE NOT d.deleted)`,
+			i+1, item.DB.Schema, winnerBody, winnerJoin(item.DB.Schema))
+	}
+	return query.String(), args
 }
 
 // Compact implements CouchDB-observable compaction. Revision histories are

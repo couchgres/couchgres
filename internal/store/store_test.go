@@ -203,6 +203,70 @@ func TestDatabaseLifecycle(t *testing.T) {
 	}
 }
 
+func TestDatabaseInfosBatch(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	a := freshDB(t, s, "it_info_a")
+	b := freshDB(t, s, "it_info_b")
+
+	if _, _, err := s.PutDoc(ctx, a, "live", body(t, `{"a":1}`), nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	purgeRev, _, err := s.PutDoc(ctx, a, "purge-me", body(t, `{"gone":true}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Purge(ctx, a, map[string][]couch.Rev{"purge-me": {purgeRev}}); err != nil {
+		t.Fatal(err)
+	}
+	bRev, _, err := s.PutDoc(ctx, b, "deleted", map[string]any{}, nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.PutDoc(ctx, b, "deleted", map[string]any{}, nil, &bRev, true, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	infos, err := s.DatabaseInfos(ctx,
+		[]string{"it_info_b", "missing", "Bad", "bad\x00name", "it_info_a", "it_info_b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 2 || infos[0].DB.Name != "it_info_a" || infos[1].DB.Name != "it_info_b" {
+		t.Fatalf("batched database order: %+v", infos)
+	}
+	if got := infos[0].Info; got.DocCount != 1 || got.DocDelCount != 0 ||
+		got.UpdateSeq != 2 || got.PurgeSeq != 1 || got.SizeBytes <= 0 || got.ExternalSize <= 0 {
+		t.Fatalf("database a info: %+v", got)
+	}
+	if got := infos[1].Info; got.DocCount != 0 || got.DocDelCount != 1 ||
+		got.UpdateSeq != 2 || got.PurgeSeq != 0 || got.SizeBytes <= 0 || got.ExternalSize != 0 {
+		t.Fatalf("database b info: %+v", got)
+	}
+	external, err := s.SizeDocsAll(ctx, a)
+	if err != nil || external != infos[0].Info.ExternalSize {
+		t.Fatalf("batched external size %d, direct size %d: %v",
+			infos[0].Info.ExternalSize, external, err)
+	}
+	purgeSeq, err := s.PurgeSeq(ctx, a)
+	if err != nil || purgeSeq != infos[0].Info.PurgeSeq {
+		t.Fatalf("batched purge seq %d, direct seq %d: %v",
+			infos[0].Info.PurgeSeq, purgeSeq, err)
+	}
+
+	single, err := s.DBInfo(ctx, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *single != infos[0].Info {
+		t.Fatalf("single info %+v differs from batch %+v", *single, infos[0].Info)
+	}
+	empty, err := s.DatabaseInfos(ctx, []string{})
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty database batch: %+v, %v", empty, err)
+	}
+}
+
 func TestDocCRUDAndRevChain(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()

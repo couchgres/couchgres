@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/couchgres/couchgres/internal/couch"
+	"github.com/couchgres/couchgres/internal/store"
 )
 
 func (s *Server) dbGet(w http.ResponseWriter, r *http.Request) error {
@@ -20,11 +21,14 @@ func (s *Server) dbGet(w http.ResponseWriter, r *http.Request) error {
 	if err := s.requireMember(r, db); err != nil {
 		return err
 	}
-	info, err := s.dbInfoJSON(r, r.PathValue("db"))
+	infos, err := s.store.DatabaseInfos(r.Context(), []string{db.Name})
 	if err != nil {
 		return err
 	}
-	writeJSON(w, 200, info)
+	if len(infos) == 0 {
+		return couch.DBNotFound()
+	}
+	writeJSON(w, 200, dbInfoJSON(infos[0]))
 	return nil
 }
 
@@ -66,45 +70,32 @@ func (s *Server) securityPut(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (s *Server) dbInfoJSON(r *http.Request, name string) (map[string]any, error) {
-	db, err := s.store.GetDB(r.Context(), name)
-	if err != nil {
-		return nil, err
-	}
-	info, err := s.store.DBInfo(r.Context(), db)
-	if err != nil {
-		return nil, err
-	}
+func dbInfoJSON(item store.DatabaseInfo) map[string]any {
+	db, info := &item.DB, &item.Info
 	props := map[string]any{}
 	if db.Partitioned {
 		props["partitioned"] = true
 	}
-	purgeSeq, err := s.store.PurgeSeq(r.Context(), db)
-	if err != nil {
-		return nil, err
-	}
 	// external is the user-data size (doc JSON + attachment bytes), so it
 	// matches the sum of the partition sizes. file/active are the physical
 	// relations, which are Postgres's business.
-	external, err := s.store.SizeDocsAll(r.Context(), db)
-	if err != nil {
-		return nil, err
-	}
 	return map[string]any{
 		"db_name":       db.Name,
 		"doc_count":     info.DocCount,
 		"doc_del_count": info.DocDelCount,
 		"update_seq":    seqString(info.UpdateSeq),
-		"purge_seq":     strconv.FormatInt(purgeSeq, 10) + "-couchgres",
+		"purge_seq":     strconv.FormatInt(info.PurgeSeq, 10) + "-couchgres",
 		"sizes": map[string]int64{
-			"file": info.SizeBytes, "external": external, "active": info.SizeBytes,
+			"file":     info.SizeBytes,
+			"external": info.ExternalSize,
+			"active":   info.SizeBytes,
 		},
 		"props":               props,
 		"compact_running":     false,
 		"disk_format_version": 8,
 		"cluster":             map[string]int{"n": 1, "q": 2, "r": 1, "w": 1},
 		"instance_start_time": db.InstanceStartTime,
-	}, nil
+	}
 }
 
 func (s *Server) dbPut(w http.ResponseWriter, r *http.Request) error {

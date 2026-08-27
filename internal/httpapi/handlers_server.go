@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/couchgres/couchgres/internal/couch"
+	"github.com/couchgres/couchgres/internal/store"
 )
 
 func (s *Server) welcome(w http.ResponseWriter, r *http.Request) error {
@@ -174,17 +175,13 @@ func (s *Server) dbsInfoAll(w http.ResponseWriter, r *http.Request) error {
 	if err := s.requireAllDBsAccess(r); err != nil {
 		return err
 	}
-	names, err := s.store.ListDatabases(r.Context())
+	infos, err := s.store.DatabaseInfos(r.Context(), nil)
 	if err != nil {
 		return err
 	}
-	out := make([]any, 0, len(names))
-	for _, name := range names {
-		info, err := s.dbInfoJSON(r, name)
-		if err != nil {
-			return err
-		}
-		out = append(out, info)
+	out := make([]any, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, dbInfoJSON(info))
 	}
 	writeJSON(w, 200, out)
 	return nil
@@ -203,6 +200,21 @@ func (s *Server) dbsInfo(w http.ResponseWriter, r *http.Request) error {
 	if !ok {
 		return couch.BadRequest("`keys` member must exist.")
 	}
+	names := make([]string, 0, len(keys))
+	for _, key := range keys {
+		name, ok := key.(string)
+		if ok {
+			names = append(names, name)
+		}
+	}
+	infos, err := s.store.DatabaseInfos(r.Context(), names)
+	if err != nil {
+		return err
+	}
+	byName := make(map[string]store.DatabaseInfo, len(infos))
+	for _, info := range infos {
+		byName[info.DB.Name] = info
+	}
 	out := make([]any, 0, len(keys))
 	for _, key := range keys {
 		name, isStr := key.(string)
@@ -210,15 +222,12 @@ func (s *Server) dbsInfo(w http.ResponseWriter, r *http.Request) error {
 			out = append(out, map[string]any{"key": key, "error": "not_found"})
 			continue
 		}
-		info, err := s.dbInfoJSON(r, name)
-		if err != nil {
-			if _, isCouch := err.(*couch.Error); isCouch {
-				out = append(out, map[string]any{"key": name, "error": "not_found"})
-				continue
-			}
-			return err
+		info, ok := byName[name]
+		if !ok {
+			out = append(out, map[string]any{"key": name, "error": "not_found"})
+			continue
 		}
-		out = append(out, map[string]any{"key": name, "info": info})
+		out = append(out, map[string]any{"key": name, "info": dbInfoJSON(info)})
 	}
 	writeJSON(w, 200, out)
 	return nil
