@@ -41,26 +41,35 @@ curl http://127.0.0.1:5984/
 
 ### couchgres.yaml
 
-| Setting              | Description                                                                                                                                |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `bind`, `port`       | Listener address. Defaults to `127.0.0.1:5984`.                                                                                            |
-| `http.*`             | Listener limits for read-header, read, write, and idle timeouts plus maximum header bytes. See `couchgres.example.yaml` for safe defaults. |
-| `postgres.url`       | PostgreSQL connection URL                                                                                                                  |
-| `postgres.pool_size` | Connection pool size                                                                                                                       |
-| `replicator.enabled` | Starts the durable `_replicator` background worker. Defaults to `true`; set `false` for API-only instances.                                |
-| `admins`             | Server administrators. Plaintext passwords are PBKDF2-hashed into PostgreSQL on first start.                                               |
-| `log`                | Log level                                                                                                                                  |
+| Setting                             | Description                                                                                                                                |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `bind`, `port`                      | Listener address. Defaults to `127.0.0.1:5984`.                                                                                            |
+| `http.*`                            | Listener limits for read-header, read, write, and idle timeouts plus maximum header bytes. See `couchgres.example.yaml` for safe defaults. |
+| `postgres.url`                      | PostgreSQL connection URL                                                                                                                  |
+| `postgres.pool_size`                | Connection pool size                                                                                                                       |
+| `replicator.enabled`                | Starts the durable `_replicator` background worker. Defaults to `true`; set `false` for API-only instances.                                |
+| `replicator.allow_private_networks` | Allows remote URL endpoints to resolve to private or special-use addresses. Defaults to `false`; local database names remain available.    |
+| `admins`                            | Server administrators. Plaintext passwords are PBKDF2-hashed into PostgreSQL on first start.                                               |
+| `log`                               | Log level                                                                                                                                  |
 
 ### Environment variables
 
-| Variable                       | When                | Description                                                                                        |
-| ------------------------------ | ------------------- | -------------------------------------------------------------------------------------------------- |
-| `COUCHGRES_ADMIN`              | Server startup      | `name:password` pair that creates an administrator if none exists                                  |
-| `COUCHGRES_REPLICATOR_ENABLED` | Server startup      | Boolean override for `replicator.enabled`                                                          |
-| `COUCHGRES_HTTP_*`             | Server startup      | Overrides the corresponding `http` timeout or `max_header_bytes` listener setting                  |
-| `COUCHGRES_LIVE_COUCH`         | Tests               | CouchDB URL (with credentials) for live collation and rev hash tests                               |
-| `COUCHGRES_URL`                | Compatibility tools | couchgres base URL for `compat/` and `compat/clients/`                                             |
-| `COUCH_URL`                    | Compatibility tools | CouchDB base URL for side by side checks. Leave credentials out so anonymous cases stay anonymous. |
+| Variable                                      | When                | Description                                                                                        |
+| --------------------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------- |
+| `COUCHGRES_ADMIN`                             | Server startup      | `name:password` pair that creates an administrator if none exists                                  |
+| `COUCHGRES_REPLICATOR_ENABLED`                | Server startup      | Boolean override for `replicator.enabled`                                                          |
+| `COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS` | Server startup      | Boolean override for `replicator.allow_private_networks`                                           |
+| `COUCHGRES_HTTP_*`                            | Server startup      | Overrides the corresponding `http` timeout or `max_header_bytes` listener setting                  |
+| `COUCHGRES_LIVE_COUCH`                        | Tests               | CouchDB URL (with credentials) for live collation and rev hash tests                               |
+| `COUCHGRES_URL`                               | Compatibility tools | couchgres base URL for `compat/` and `compat/clients/`                                             |
+| `COUCH_URL`                                   | Compatibility tools | CouchDB base URL for side by side checks. Leave credentials out so anonymous cases stay anonymous. |
+
+Outbound replication accepts only HTTP and HTTPS endpoints. URL-form peers
+must resolve exclusively to public addresses unless
+`replicator.allow_private_networks` is enabled; local database names always use
+the trusted loopback endpoint. Redirects are revalidated, environment HTTP
+proxies are not used, and peer responses and multipart attachment parts have a
+64 MiB in-memory ceiling.
 
 ### Runtime settings (Config API)
 

@@ -72,6 +72,7 @@ func run() error {
 	if selfHost == "0.0.0.0" || selfHost == "::" || selfHost == "" {
 		selfHost = "127.0.0.1"
 	}
+	api.SetReplicatorAllowPrivateNetworks(cfg.Replicator.AllowPrivateNetworks)
 	api.SetSelfURL("http://" + net.JoinHostPort(selfHost, strconv.Itoa(cfg.Port)))
 	api.SetStreamWriteTimeout(cfg.HTTP.WriteTimeout.Std())
 	server := newHTTPServer(addr, api, cfg.HTTP)

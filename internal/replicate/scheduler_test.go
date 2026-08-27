@@ -60,3 +60,24 @@ func TestSchedulerPruneDoesNotClobberReplacement(t *testing.T) {
 		t.Fatalf("pruned replacement: %+v", jobs)
 	}
 }
+
+func TestSchedulerPrivateNetworkPolicyKeepsLocalNames(t *testing.T) {
+	s := NewScheduler(nil, nil)
+	s.SetSelf("http://127.0.0.1:5984", func() string { return "cookie" })
+
+	local, err := s.resolve("local_db")
+	if err != nil {
+		t.Fatalf("local database name: %v", err)
+	}
+	if local.cookie != "cookie" {
+		t.Fatal("local database did not receive the self-authentication cookie")
+	}
+	if _, err := s.resolve("http://127.0.0.1:5984/remote_db"); err == nil {
+		t.Fatal("URL-form private endpoint was allowed by default")
+	}
+
+	s.SetAllowPrivateNetworks(true)
+	if _, err := s.resolve("http://127.0.0.1:5984/remote_db"); err != nil {
+		t.Fatalf("private endpoint opt-in: %v", err)
+	}
+}

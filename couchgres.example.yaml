@@ -18,6 +18,9 @@ postgres:
 # Durable _replicator worker
 replicator:
   enabled: true
+  # Remote URL endpoints resolving to private/special-use IPs are blocked by
+  # default. Local database names still work. Enable only for trusted LAN peers.
+  allow_private_networks: false
 
 # Admins
 #   Plaintext values are pbkdf2-hashed into Postgres

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -41,7 +42,12 @@ func (p *Peer) FetchRevsMultipart(ctx context.Context, id string, revs []string)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		_ = drainResponseBody(resp, p.maxResponseBytes)
 		return nil, fmt.Errorf("multipart open_revs %s: HTTP %d", id, resp.StatusCode)
+	}
+	body, err := boundedResponseBody(resp, p.maxResponseBytes)
+	if err != nil {
+		return nil, err
 	}
 	mediaType, params, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if err != nil {
@@ -49,14 +55,17 @@ func (p *Peer) FetchRevsMultipart(ctx context.Context, id string, revs []string)
 	}
 	if mediaType == "application/json" {
 		// No attachments are present. Some servers answer JSON regardless.
-		return decodeOpenRevsJSON(resp.Body)
+		return decodeOpenRevsJSON(body, p.maxResponseBytes)
 	}
 	if mediaType != "multipart/mixed" {
 		return nil, fmt.Errorf("multipart open_revs %s: unexpected %s", id, mediaType)
 	}
+	if params["boundary"] == "" {
+		return nil, fmt.Errorf("multipart open_revs %s: missing boundary", id)
+	}
 
 	var docs []map[string]any
-	reader := multipart.NewReader(resp.Body, params["boundary"])
+	reader := multipart.NewReader(body, params["boundary"])
 	for {
 		part, err := reader.NextPart()
 		if err == io.EOF {
@@ -71,7 +80,7 @@ func (p *Peer) FetchRevsMultipart(ctx context.Context, id string, revs []string)
 		}
 		switch partType {
 		case "application/json":
-			doc, err := decodeDocPart(part)
+			doc, err := decodeDocPart(part, p.maxResponseBytes)
 			if err != nil {
 				return nil, err
 			}
@@ -79,7 +88,11 @@ func (p *Peer) FetchRevsMultipart(ctx context.Context, id string, revs []string)
 				docs = append(docs, doc)
 			}
 		case "multipart/related":
-			doc, err := decodeRelatedPart(part, partParams["boundary"])
+			if partParams["boundary"] == "" {
+				return nil, errors.New("multipart/related part has no boundary")
+			}
+			doc, err := decodeRelatedPart(part, partParams["boundary"],
+				p.maxResponseBytes, p.maxAttachmentBytes)
 			if err != nil {
 				return nil, err
 			}
@@ -90,8 +103,8 @@ func (p *Peer) FetchRevsMultipart(ctx context.Context, id string, revs []string)
 }
 
 // decodeDocPart reads a JSON part. "missing" entries return nil.
-func decodeDocPart(part io.Reader) (map[string]any, error) {
-	raw, err := io.ReadAll(part)
+func decodeDocPart(part io.Reader, maxBytes int64) (map[string]any, error) {
+	raw, err := readAllBounded(part, maxBytes, ErrResponseTooLarge)
 	if err != nil {
 		return nil, err
 	}
@@ -109,13 +122,13 @@ func decodeDocPart(part io.Reader) (map[string]any, error) {
 
 // decodeRelatedPart reads a doc + attachment-parts bundle and inlines the
 // attachment bytes (in their transferred, possibly encoded form).
-func decodeRelatedPart(part io.Reader, boundary string) (map[string]any, error) {
+func decodeRelatedPart(part io.Reader, boundary string, maxDocBytes, maxAttachmentBytes int64) (map[string]any, error) {
 	reader := multipart.NewReader(part, boundary)
 	docPart, err := reader.NextPart()
 	if err != nil {
 		return nil, err
 	}
-	raw, err := io.ReadAll(docPart)
+	raw, err := readAllBounded(docPart, maxDocBytes, ErrResponseTooLarge)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +152,7 @@ func decodeRelatedPart(part io.Reader, boundary string) (map[string]any, error) 
 		if err != nil {
 			return nil, err
 		}
-		data, err := io.ReadAll(attPart)
+		data, err := readAllBounded(attPart, maxAttachmentBytes, ErrAttachmentTooLarge)
 		if err != nil {
 			return nil, err
 		}
@@ -234,7 +247,9 @@ func (p *Peer) pushDocMultipart(ctx context.Context, doc map[string]any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	if err := drainResponseBody(resp, p.maxResponseBytes); err != nil {
+		return err
+	}
 	if resp.StatusCode != 201 && resp.StatusCode != 202 {
 		return fmt.Errorf("multipart PUT %s: HTTP %d", id, resp.StatusCode)
 	}
@@ -286,8 +301,12 @@ func followsOrder(raw []byte) ([]string, error) {
 	return names, nil
 }
 
-func decodeOpenRevsJSON(body io.Reader) ([]map[string]any, error) {
-	dec := json.NewDecoder(body)
+func decodeOpenRevsJSON(body io.Reader, maxBytes int64) ([]map[string]any, error) {
+	raw, err := readAllBounded(body, maxBytes, ErrResponseTooLarge)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var entries []struct {
 		OK map[string]any `json:"ok"`

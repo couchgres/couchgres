@@ -17,10 +17,11 @@ type Scheduler struct {
 	store  *store.Store
 	broker *store.Broker
 
-	mu       sync.Mutex
-	jobs     map[string]*Job // by replication id
-	selfBase string          // this server's own base URL for local db names
-	cookie   func() string   // mints an admin session for loopback requests
+	mu                   sync.Mutex
+	jobs                 map[string]*Job // by replication id
+	selfBase             string          // this server's own base URL for local db names
+	cookie               func() string   // mints an admin session for loopback requests
+	allowPrivateNetworks bool            // permits explicitly configured remote LAN peers
 }
 
 // Job is one replication, running or finished.
@@ -73,19 +74,30 @@ func (s *Scheduler) SetSelf(base string, cookie func() string) {
 	s.cookie = cookie
 }
 
+// SetAllowPrivateNetworks controls whether URL-form replication endpoints may
+// resolve to loopback, private, link-local, or other special-use addresses.
+// Local database names use the separately configured self URL and remain
+// available regardless of this setting.
+func (s *Scheduler) SetAllowPrivateNetworks(allow bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.allowPrivateNetworks = allow
+}
+
 // resolve turns a replication endpoint (URL or local db name) into a Peer.
 func (s *Scheduler) resolve(endpoint string) (*Peer, error) {
-	if strings.Contains(endpoint, "://") {
-		return NewPeer(endpoint)
-	}
 	s.mu.Lock()
 	base, cookie := s.selfBase, s.cookie
+	allowPrivateNetworks := s.allowPrivateNetworks
 	s.mu.Unlock()
+	if strings.Contains(endpoint, "://") {
+		return newPeer(endpoint, peerConfig{allowPrivateNetworks: allowPrivateNetworks})
+	}
 	if base == "" {
 		return nil, couch.NewError(500, "unknown_error",
 			"local replication endpoints are not available before startup completes")
 	}
-	peer, err := NewPeer(base + "/" + endpoint)
+	peer, err := newPeer(base+"/"+endpoint, peerConfig{allowPrivateNetworks: true})
 	if err != nil {
 		return nil, err
 	}

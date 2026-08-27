@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -182,8 +183,9 @@ func endpointForDisplay(v any) any {
 	if raw == "" {
 		return v
 	}
-	if peer, err := replicate.NewPeer(raw); err == nil {
-		return peer.URL()
+	if parsed, err := url.Parse(raw); err == nil && parsed.IsAbs() && parsed.Host != "" {
+		parsed.User = nil
+		return strings.TrimRight(parsed.String(), "/") + "/"
 	}
 	return raw
 }

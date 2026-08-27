@@ -55,7 +55,8 @@ type HTTP struct {
 }
 
 type Replicator struct {
-	Enabled bool `yaml:"enabled"`
+	Enabled              bool `yaml:"enabled"`
+	AllowPrivateNetworks bool `yaml:"allow_private_networks"`
 }
 
 func defaults() Config {
@@ -145,6 +146,14 @@ func Load(path string) (Config, error) {
 			return cfg, fmt.Errorf("COUCHGRES_REPLICATOR_ENABLED must be a boolean: %q", v)
 		}
 		cfg.Replicator.Enabled = enabled
+	}
+	if v := os.Getenv("COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS"); v != "" {
+		allow, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf(
+				"COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS must be a boolean: %q", v)
+		}
+		cfg.Replicator.AllowPrivateNetworks = allow
 	}
 	// COUCHGRES_ADMIN=name:password adds a server admin without a config
 	// file (used by CI and quick starts).

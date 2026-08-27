@@ -21,25 +21,40 @@ import (
 
 // Peer is one replication endpoint (a database URL).
 type Peer struct {
-	base   string // scheme://host/db, credentials stripped
-	auth   string // Authorization header value, if the URL carried userinfo
-	cookie string // AuthSession value for loopback requests
-	client *http.Client
+	base               string // scheme://host/db, credentials stripped
+	auth               string // Authorization header value, if the URL carried userinfo
+	cookie             string // AuthSession value for loopback requests
+	client             *http.Client
+	maxResponseBytes   int64
+	maxAttachmentBytes int64
 }
 
 // NewPeer parses a database URL. Credentials in the URL become a Basic
 // Authorization header (and are never reported back to clients).
 func NewPeer(rawURL string) (*Peer, error) {
+	return newPeer(rawURL, peerConfig{})
+}
+
+func newPeer(rawURL string, cfg peerConfig) (*Peer, error) {
+	cfg = cfg.withDefaults()
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, couch.BadRequest("Invalid replication endpoint: " + rawURL)
+		return nil, couch.BadRequest("Invalid replication endpoint")
 	}
-	peer := &Peer{client: &http.Client{Timeout: 5 * time.Minute}}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	peer := &Peer{
+		client:             newPeerHTTPClient(cfg),
+		maxResponseBytes:   cfg.maxResponseBytes,
+		maxAttachmentBytes: cfg.maxAttachmentBytes,
+	}
 	if parsed.User != nil {
 		password, _ := parsed.User.Password()
 		cred := parsed.User.Username() + ":" + password
 		peer.auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(cred))
 		parsed.User = nil
+	}
+	if err := validatePeerURL(parsed, cfg.allowPrivateNetworks); err != nil {
+		return nil, couch.BadRequest("Invalid replication endpoint: " + err.Error())
 	}
 	peer.base = strings.TrimRight(parsed.String(), "/")
 	return peer, nil
@@ -106,7 +121,7 @@ func (p *Peer) rpc(ctx context.Context, method, path string, body, out any, okSt
 		return 0, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readResponseBody(resp, p.maxResponseBytes)
 	if err != nil {
 		return resp.StatusCode, err
 	}
@@ -275,7 +290,7 @@ func (p *Peer) FetchRevs(ctx context.Context, missing map[string][]string) ([]ma
 			}
 			// JSON inlines only decoded attachment data. Encoded (gzip)
 			// attachments must be refetched as multipart so their stored
-// bytes, and therefore digests, survive the copy.
+			// bytes, and therefore digests, survive the copy.
 			if hasEncodedAttachments(entry.OK) {
 				id, _ := entry.OK["_id"].(string)
 				rev, _ := entry.OK["_rev"].(string)
