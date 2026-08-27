@@ -163,7 +163,7 @@ func TestBootstrapSystemDBsAndStableUUID(t *testing.T) {
 	if uuid1 != uuid2 {
 		t.Fatal("server uuid must be stable across restarts")
 	}
-	names, err := s.ListDatabases(ctx)
+	names, err := s.ListDatabases(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +171,103 @@ func TestBootstrapSystemDBsAndStableUUID(t *testing.T) {
 		if !slices.Contains(names, sys) {
 			t.Errorf("system db %s missing from %v", sys, names)
 		}
+	}
+	var listIndexExists bool
+	if err := s.pool.QueryRow(ctx,
+		"SELECT to_regclass('couchgres.databases_name_c_idx') IS NOT NULL",
+	).Scan(&listIndexExists); err != nil {
+		t.Fatal(err)
+	}
+	if !listIndexExists {
+		t.Fatal("byte-ordered database-name index was not installed")
+	}
+}
+
+func TestListDatabasesAppliesQueryOptions(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	names := []string{
+		"it_list_dbs_a", "it_list_dbs_b", "it_list_dbs_c", "it_list_dbs_d",
+	}
+	for _, name := range names {
+		freshDB(t, s, name)
+	}
+
+	a, b, c, d := names[0], names[1], names[2], names[3]
+	bNUL, cNUL := b+"\x00", c+"\x00"
+	zero, one, two, ten := int64(0), int64(1), int64(2), int64(10)
+	tests := []struct {
+		name   string
+		params ListDatabasesParams
+		want   []string
+	}{
+		{
+			name:   "inclusive bounds",
+			params: ListDatabasesParams{StartKey: &b, EndKey: &d},
+			want:   []string{b, c, d},
+		},
+		{
+			name: "descending bounds",
+			params: ListDatabasesParams{
+				Descending: true, StartKey: &d, EndKey: &b,
+			},
+			want: []string{d, c, b},
+		},
+		{
+			name: "skip and limit",
+			params: ListDatabasesParams{
+				StartKey: &a, EndKey: &d, Skip: &one, Limit: &two,
+			},
+			want: []string{b, c},
+		},
+		{
+			name: "descending skip and limit",
+			params: ListDatabasesParams{
+				Descending: true, StartKey: &d, EndKey: &a,
+				Skip: &one, Limit: &two,
+			},
+			want: []string{c, b},
+		},
+		{
+			name: "zero limit",
+			params: ListDatabasesParams{
+				StartKey: &a, EndKey: &d, Limit: &zero,
+			},
+			want: []string{},
+		},
+		{
+			name: "skip past end",
+			params: ListDatabasesParams{
+				StartKey: &a, EndKey: &d, Skip: &ten,
+			},
+			want: []string{},
+		},
+		{
+			name:   "NUL start bound",
+			params: ListDatabasesParams{StartKey: &bNUL, EndKey: &d},
+			want:   []string{c, d},
+		},
+		{
+			name:   "NUL end bound",
+			params: ListDatabasesParams{StartKey: &a, EndKey: &cNUL},
+			want:   []string{a, b, c},
+		},
+		{
+			name:   "empty range",
+			params: ListDatabasesParams{StartKey: &d, EndKey: &b},
+			want:   []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := s.ListDatabases(ctx, &tt.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("ListDatabases() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

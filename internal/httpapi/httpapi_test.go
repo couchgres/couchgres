@@ -386,3 +386,67 @@ func TestServerEndpoints(t *testing.T) {
 		t.Fatalf("fallback: %+v", resp)
 	}
 }
+
+func TestAllDBsQueryOptions(t *testing.T) {
+	h := testHandler(t)
+	names := []string{
+		"it_http_all_dbs_a", "it_http_all_dbs_b",
+		"it_http_all_dbs_c", "it_http_all_dbs_d",
+	}
+	for _, name := range names {
+		send(t, h, "DELETE", "/"+name, nil, testAdminAuth, adminAuth())
+		if resp := send(t, h, "PUT", "/"+name, nil, testAdminAuth, adminAuth()); resp.status != 201 {
+			t.Fatalf("create %s: %+v", name, resp)
+		}
+		name := name
+		t.Cleanup(func() {
+			send(t, h, "DELETE", "/"+name, nil, testAdminAuth, adminAuth())
+		})
+	}
+
+	tests := []struct {
+		name string
+		path string
+		want []string
+	}{
+		{
+			name: "canonical bounds and page",
+			path: "/_all_dbs?startkey=%22it_http_all_dbs_b%22" +
+				"&endkey=%22it_http_all_dbs_d%22&skip=1&limit=1",
+			want: []string{"it_http_all_dbs_c"},
+		},
+		{
+			name: "aliases and descending page",
+			path: "/_all_dbs?descending=true&start_key=%22it_http_all_dbs_d%22" +
+				"&end_key=%22it_http_all_dbs_b%22&skip=1&limit=1",
+			want: []string{"it_http_all_dbs_c"},
+		},
+		{
+			name: "zero limit",
+			path: "/_all_dbs?startkey=%22it_http_all_dbs_a%22" +
+				"&endkey=%22it_http_all_dbs_d%22&limit=0",
+			want: []string{},
+		},
+		{
+			name: "NUL bound",
+			path: "/_all_dbs?startkey=%22it_http_all_dbs_b%5Cu0000%22" +
+				"&endkey=%22it_http_all_dbs_d%22",
+			want: []string{"it_http_all_dbs_c", "it_http_all_dbs_d"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := send(t, h, "GET", tt.path, nil, testAdminAuth, adminAuth())
+			if resp.status != 200 {
+				t.Fatalf("_all_dbs: %+v", resp)
+			}
+			got := make([]string, len(resp.array))
+			for i, value := range resp.array {
+				got[i], _ = value.(string)
+			}
+			if strings.Join(got, "\n") != strings.Join(tt.want, "\n") {
+				t.Fatalf("_all_dbs = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

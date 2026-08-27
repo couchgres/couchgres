@@ -177,10 +177,63 @@ func (s *Store) GetDB(ctx context.Context, name string) (*DB, error) {
 	return db, nil
 }
 
-// ListDatabases returns names in byte order (the _all_dbs order).
-func (s *Store) ListDatabases(ctx context.Context) ([]string, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT name FROM couchgres.databases ORDER BY name COLLATE "C"`)
+// ListDatabasesParams contains the ordering and pagination options for
+// CouchDB's _all_dbs endpoint. Bounds are inclusive.
+type ListDatabasesParams struct {
+	Descending bool
+	StartKey   *string
+	EndKey     *string
+	Skip       *int64
+	Limit      *int64
+}
+
+// ListDatabases returns names in CouchDB byte order. PostgreSQL applies all
+// bounds and pagination so callers never need to materialize the registry.
+func (s *Store) ListDatabases(ctx context.Context, p *ListDatabasesParams) ([]string, error) {
+	if p == nil {
+		p = &ListDatabasesParams{}
+	}
+	query := `SELECT name FROM couchgres.databases`
+	conditions := make([]string, 0, 2)
+	args := make([]any, 0, 4)
+	addBound := func(value *string, ascendingOp, descendingOp string) {
+		if value == nil {
+			return
+		}
+		op := ascendingOp
+		if p.Descending {
+			op = descendingOp
+		}
+		column := `name COLLATE "C"`
+		arg := any(*value)
+		// PostgreSQL text cannot contain NUL. The bytea fallback preserves the
+		// endpoint's byte-order comparison for arbitrary JSON string bounds.
+		if strings.IndexByte(*value, 0) >= 0 {
+			column = `convert_to(name, 'UTF8')`
+			arg = []byte(*value)
+		}
+		args = append(args, arg)
+		conditions = append(conditions,
+			fmt.Sprintf("%s %s $%d", column, op, len(args)))
+	}
+	addBound(p.StartKey, ">=", "<=")
+	addBound(p.EndKey, "<=", ">=")
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += ` ORDER BY name COLLATE "C"`
+	if p.Descending {
+		query += " DESC"
+	}
+	if p.Limit != nil {
+		args = append(args, *p.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+	}
+	if p.Skip != nil {
+		args = append(args, *p.Skip)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

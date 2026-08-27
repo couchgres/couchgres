@@ -121,16 +121,9 @@ func (s *Server) allDBs(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	q := r.URL.Query()
-	names, err := s.store.ListDatabases(r.Context())
-	if err != nil {
-		return err
-	}
 	descending, err := boolParam(q, "descending", false)
 	if err != nil {
 		return err
-	}
-	if descending {
-		reverse(names)
 	}
 	start, err := jsonStringParam(q, "startkey", "start_key")
 	if err != nil {
@@ -148,26 +141,17 @@ func (s *Server) allDBs(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-
-	filtered := names[:0]
-	for _, name := range names {
-		afterStart := start == nil ||
-			(!descending && name >= *start) || (descending && name <= *start)
-		beforeEnd := end == nil ||
-			(!descending && name <= *end) || (descending && name >= *end)
-		if afterStart && beforeEnd {
-			filtered = append(filtered, name)
-		}
+	names, err := s.store.ListDatabases(r.Context(), &store.ListDatabasesParams{
+		Descending: descending,
+		StartKey:   start,
+		EndKey:     end,
+		Skip:       skip,
+		Limit:      limit,
+	})
+	if err != nil {
+		return err
 	}
-	if skip != nil && *skip < int64(len(filtered)) {
-		filtered = filtered[*skip:]
-	} else if skip != nil {
-		filtered = filtered[:0]
-	}
-	if limit != nil && *limit < int64(len(filtered)) {
-		filtered = filtered[:*limit]
-	}
-	writeJSON(w, 200, filtered)
+	writeJSON(w, 200, names)
 	return nil
 }
 
@@ -235,12 +219,6 @@ func (s *Server) dbsInfo(w http.ResponseWriter, r *http.Request) error {
 
 func randomUUID() string {
 	return randomHex32()
-}
-
-func reverse(s []string) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
-	}
 }
 
 // requireJSONContentType enforces CouchDB's validate_ctype on POST bodies

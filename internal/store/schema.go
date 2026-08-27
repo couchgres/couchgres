@@ -22,6 +22,10 @@ ALTER TABLE couchgres.databases
     ADD COLUMN IF NOT EXISTS doc_count bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS doc_del_count bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS doc_counts_initialized boolean NOT NULL DEFAULT false;
+-- _all_dbs requires byte-order bounds and ordering regardless of the database's
+-- default collation. This expression index supports both scan directions.
+CREATE INDEX IF NOT EXISTS databases_name_c_idx
+    ON couchgres.databases (name COLLATE "C");
 
 -- Statement-level transition tables make one counter adjustment per write
 -- statement, including a whole _bulk_docs winner refresh. The INSERT and UPDATE
