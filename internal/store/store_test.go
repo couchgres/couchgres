@@ -638,6 +638,135 @@ func TestAllDocsRangesAndKeys(t *testing.T) {
 	}
 }
 
+func TestPendingAfterCachesCommittedGenerations(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_pending")
+
+	rev1, seq1, err := s.PutDoc(ctx, db, "one", body(t, `{"n":1}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev2, _, err := s.PutDoc(ctx, db, "two", body(t, `{"n":2}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, seq3, err := s.PutDoc(ctx, db, "three", body(t, `{"n":3}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := s.PendingAfter(ctx, db, seq1)
+	if err != nil || pending != 2 {
+		t.Fatalf("initial pending = %d, %v", pending, err)
+	}
+	if got := pendingCacheEntry(t, &s.pendingCounts, db.Schema, seq1, seq3, 0); got != 2 {
+		t.Fatalf("initial cache = %d", got)
+	}
+	if pending, err = s.PendingAfter(ctx, db, seq1); err != nil || pending != 2 {
+		t.Fatalf("cached pending = %d, %v", pending, err)
+	}
+	if pending, err = s.PendingAfter(ctx, db, seq3); err != nil || pending != 0 {
+		t.Fatalf("caught-up pending = %d, %v", pending, err)
+	}
+
+	_, seq4, err := s.PutDoc(ctx, db, "one", body(t, `{"n":4}`), nil, &rev1, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending, err = s.PendingAfter(ctx, db, seq1); err != nil || pending != 3 {
+		t.Fatalf("new generation pending = %d, %v", pending, err)
+	}
+	if got := pendingCacheEntry(t, &s.pendingCounts, db.Schema, seq1, seq4, 0); got != 3 {
+		t.Fatalf("new generation cache = %d", got)
+	}
+
+	if _, err := s.Purge(ctx, db, map[string][]couch.Rev{"two": {rev2}}); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err = s.PendingAfter(ctx, db, seq1); err != nil || pending != 2 {
+		t.Fatalf("post-purge pending = %d, %v", pending, err)
+	}
+	if got := pendingCacheEntry(t, &s.pendingCounts, db.Schema, seq1, seq4, 1); got != 2 {
+		t.Fatalf("post-purge cache = %d", got)
+	}
+}
+
+func TestPendingAfterHandlesOutOfOrderCommits(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_pending_commit_order")
+
+	_, _, err := s.PutDoc(ctx, db, "one", body(t, `{"n":1}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = s.PutDoc(ctx, db, "two", body(t, `{"n":2}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev3, seq3, err := s.PutDoc(ctx, db, "three", body(t, `{"n":3}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slow, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slow.Rollback(ctx)
+	if _, err := slow.Exec(ctx, fmt.Sprintf(
+		"UPDATE %s.docs SET seq = nextval('%s.update_seq') WHERE id = 'two'",
+		db.Schema, db.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	_, seq5, err := s.PutDoc(ctx, db, "three", body(t, `{"n":5}`), nil, &rev3, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := s.PendingAfter(ctx, db, seq3); err != nil || pending != 1 {
+		t.Fatalf("pending before older commit = %d, %v", pending, err)
+	}
+	if err := slow.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := s.PendingAfter(ctx, db, seq3); err != nil || pending != 2 {
+		t.Fatalf("pending after older commit = %d, %v", pending, err)
+	}
+	if seq5 <= seq3 {
+		t.Fatal("test setup did not advance the update sequence")
+	}
+}
+
+func pendingCacheEntry(t *testing.T, cache *pendingCountCache, schema string, after, maxSeq, purgeSeq int64) int64 {
+	t.Helper()
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	for key, value := range cache.values {
+		if key.schema == schema && key.after == after && key.maxSeq == maxSeq && key.purgeSeq == purgeSeq {
+			return value
+		}
+	}
+	t.Fatal("pending count was not cached")
+	return 0
+}
+
+func TestPendingCountCacheIsBounded(t *testing.T) {
+	var cache pendingCountCache
+	for i := 0; i < pendingCountCacheCapacity+10; i++ {
+		cache.put(pendingCountKey{schema: "db", after: int64(i)}, int64(i))
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if len(cache.values) != pendingCountCacheCapacity || len(cache.order) != pendingCountCacheCapacity {
+		t.Fatalf("cache sizes = (%d, %d), want %d",
+			len(cache.values), len(cache.order), pendingCountCacheCapacity)
+	}
+	if _, ok := cache.values[pendingCountKey{schema: "db", after: 0}]; ok {
+		t.Fatal("oldest cache entry was not evicted")
+	}
+}
+
 func rowIDs(page *AllDocsPage) []string {
 	ids := make([]string, len(page.Rows))
 	for i, r := range page.Rows {

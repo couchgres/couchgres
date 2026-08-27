@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/couchgres/couchgres/internal/store"
 )
 
 func TestReplicationPushSequence(t *testing.T) {
@@ -257,6 +259,11 @@ func TestChangesFeeds(t *testing.T) {
 	if len(results) != 1 || results[0].(map[string]any)["id"] != "two" {
 		t.Fatalf("_doc_ids filter: %+v", resp.body)
 	}
+	resp = send(t, h, "POST", "/rep_feeds/_changes?filter=_doc_ids",
+		decode(t, `{"doc_ids":["one"]}`))
+	if resp.body["pending"].(float64) != 1 {
+		t.Fatalf("_doc_ids pending: %+v", resp.body)
+	}
 
 	// longpoll: a concurrent write wakes the request.
 	writeDone := make(chan struct{})
@@ -300,6 +307,28 @@ func TestChangesFeeds(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "data: {") {
 		t.Fatalf("eventsource body: %q", rec.Body.String())
+	}
+}
+
+func TestChangesScanExhausted(t *testing.T) {
+	if !changesScanExhausted(&changesRequest{}, 0) {
+		t.Fatal("unlimited database scan should be exhausted")
+	}
+	one := int64(1)
+	limited := &changesRequest{params: store.ChangesParams{Limit: &one}}
+	if changesScanExhausted(limited, 1) {
+		t.Fatal("full limited page may have pending changes")
+	}
+	if !changesScanExhausted(limited, 0) {
+		t.Fatal("short limited page should be exhausted")
+	}
+	docIDs := &changesRequest{params: store.ChangesParams{DocIDs: []string{"one"}}}
+	if changesScanExhausted(docIDs, 1) {
+		t.Fatal("document filter does not scan every database change")
+	}
+	design := &changesRequest{params: store.ChangesParams{DesignOnly: true}}
+	if changesScanExhausted(design, 1) {
+		t.Fatal("design filter does not scan every database change")
 	}
 }
 

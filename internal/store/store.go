@@ -32,6 +32,10 @@ type Store struct {
 	// view count on every read. Purge deletes view rows without
 	// bumping last_seq, so it clears the cache instead.
 	viewTotals sync.Map
+	// pendingCounts caches exact _changes pending counts against committed
+	// document and purge generations. It is bounded because clients control
+	// the since sequence.
+	pendingCounts pendingCountCache
 
 	// Change notifications use notifyChanged after commit instead of pg_notify
 	// inside the transaction. Postgres serializes every notifying commit on one

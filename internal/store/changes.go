@@ -41,6 +41,52 @@ type ChangesParams struct {
 	DesignOnly bool
 }
 
+const pendingCountCacheCapacity = 1024
+
+type pendingCountKey struct {
+	schema   string
+	after    int64
+	maxSeq   int64
+	purgeSeq int64
+	snapshot string
+}
+
+// pendingCountCache is a bounded FIFO cache. A client controls after, so an
+// unbounded map would turn arbitrary since values into retained memory.
+type pendingCountCache struct {
+	mu     sync.Mutex
+	values map[pendingCountKey]int64
+	order  []pendingCountKey
+	next   int
+}
+
+func (c *pendingCountCache) get(key pendingCountKey) (int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value, ok := c.values[key]
+	return value, ok
+}
+
+func (c *pendingCountCache) put(key pendingCountKey, value int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.values == nil {
+		c.values = make(map[pendingCountKey]int64, pendingCountCacheCapacity)
+	}
+	if _, ok := c.values[key]; ok {
+		c.values[key] = value
+		return
+	}
+	if len(c.order) < pendingCountCacheCapacity {
+		c.order = append(c.order, key)
+	} else {
+		delete(c.values, c.order[c.next])
+		c.order[c.next] = key
+		c.next = (c.next + 1) % pendingCountCacheCapacity
+	}
+	c.values[key] = value
+}
+
 // Changes reads committed changes after Since, in seq order.
 func (s *Store) Changes(ctx context.Context, db *DB, p *ChangesParams) ([]Change, error) {
 	conditions := []string{"d.seq > $1"}
@@ -144,10 +190,38 @@ func (s *Store) attachConflictLeaves(ctx context.Context, db *DB, changes []Chan
 }
 
 // PendingAfter counts changes past the given seq (the "pending" member).
+// Repeated polls first read the committed maximum docs sequence through the
+// sequence index and reuse a bounded exact count for that generation. purge_seq
+// is part of the key because a full purge can remove a docs row without moving
+// its update sequence. The transaction snapshot protects the cache from an
+// older sequence committing after a newer one (which would leave maxSeq
+// unchanged).
 func (s *Store) PendingAfter(ctx context.Context, db *DB, seq int64) (int64, error) {
+	var maxSeq, purgeSeq int64
+	var snapshot string
+	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		`SELECT coalesce((SELECT seq FROM %s.docs ORDER BY seq DESC LIMIT 1), 0),
+		        purge_seq, pg_current_snapshot()::text
+		 FROM couchgres.databases WHERE name = $1`, db.Schema), db.Name,
+	).Scan(&maxSeq, &purgeSeq, &snapshot); err != nil {
+		return 0, err
+	}
+	if seq >= maxSeq {
+		return 0, nil
+	}
+	key := pendingCountKey{
+		schema: db.Schema, after: seq, maxSeq: maxSeq, purgeSeq: purgeSeq,
+		snapshot: snapshot,
+	}
+	if n, ok := s.pendingCounts.get(key); ok {
+		return n, nil
+	}
 	var n int64
 	err := s.pool.QueryRow(ctx, fmt.Sprintf(
 		"SELECT count(*) FROM %s.docs WHERE seq > $1", db.Schema), seq).Scan(&n)
+	if err == nil {
+		s.pendingCounts.put(key, n)
+	}
 	return n, err
 }
 

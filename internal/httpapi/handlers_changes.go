@@ -336,10 +336,12 @@ func (s *Server) changesNormal(w http.ResponseWriter, r *http.Request, db *store
 			}
 		}
 	}
+	exhausted := changesScanExhausted(req, len(changes))
 
 	// A filtered feed applies the client's limit after filtering.
 	if req.filterFn != nil && req.userLimit != nil && int64(len(filtered)) > *req.userLimit {
 		filtered = filtered[:*req.userLimit]
+		exhausted = false
 		lastSeq = req.params.Since
 		for _, c := range filtered {
 			if c.Seq > lastSeq {
@@ -355,12 +357,15 @@ func (s *Server) changesNormal(w http.ResponseWriter, r *http.Request, db *store
 		}
 		rows = append(rows, row)
 	}
-	pending, err := s.store.PendingAfter(r.Context(), db, lastSeq)
-	if err != nil {
-		if headersSent {
-			return nil // status already on the wire
+	pending := int64(0)
+	if !exhausted {
+		pending, err = s.store.PendingAfter(r.Context(), db, lastSeq)
+		if err != nil {
+			if headersSent {
+				return nil // status already on the wire
+			}
+			return err
 		}
-		return err
 	}
 	response := map[string]any{
 		"results":  rows,
@@ -377,6 +382,15 @@ func (s *Server) changesNormal(w http.ResponseWriter, r *http.Request, db *store
 	}
 	writeJSON(w, 200, response)
 	return nil
+}
+
+// changesScanExhausted reports when the store query consumed every visible
+// database change, making pending known to be zero without another query.
+func changesScanExhausted(req *changesRequest, scanned int) bool {
+	if len(req.params.DocIDs) > 0 || req.params.DesignOnly {
+		return false
+	}
+	return req.params.Limit == nil || int64(scanned) < *req.params.Limit
 }
 
 // changesStream serves feed=continuous (JSON lines) and feed=eventsource.
