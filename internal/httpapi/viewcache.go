@@ -1,12 +1,9 @@
 package httpapi
 
 // viewRespCache caches whole view responses keyed by request path+query.
-// Each hit checks the database sequence state before returning a cached body.
-// CouchDB view ETags use the same rule.
-//
-// Ordinary writes, index updates, and design-doc edits invalidate entries
-// automatically. Purge changes view rows without bumping a sequence, so the
-// purge handler clears cached entries for that database.
+// Each hit checks the durable database and purge generations before returning
+// a cached body. Local clears provide eager eviction, but correctness does not
+// depend on process-local state.
 
 import (
 	"sync"
@@ -18,13 +15,14 @@ const (
 )
 
 type viewRespEntry struct {
-	schema  string
-	ddocID  string
-	sig     string
-	etag    string
-	ddocSeq int64
-	lastSeq int64
-	body    []byte
+	schema   string
+	ddocID   string
+	sig      string
+	etag     string
+	ddocSeq  int64
+	lastSeq  int64
+	purgeSeq int64
+	body     []byte
 }
 
 type viewRespCache struct {

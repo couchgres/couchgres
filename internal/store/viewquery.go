@@ -44,6 +44,10 @@ type ViewQuery struct {
 	// knows it (SyncViewGroup returns it). <= 0 means unknown and the
 	// query re-reads view_state where needed.
 	LastSeqHint int64
+	// PurgeSeqHint carries the durable purge generation captured before this
+	// query. Together with LastSeqHint it makes process-local total_rows caches
+	// safe when another Couchgres process purges view rows.
+	PurgeSeqHint *int64
 }
 
 // ViewRow is one result row. Doc members are set for include_docs.
@@ -279,7 +283,9 @@ func (s *Store) queryViewMap(ctx context.Context, db *DB, vg *ViewGroup, viewNam
 	// The counts and row scan travel as one pipelined batch. The round trip,
 	// not the SQL, is the read path's dominant cost.
 	var total, inRange, before int64
-	cached, lastSeq, hit := s.cachedViewTotal(ctx, db, vg.Sig, viewName, q.Partition, q.LastSeqHint)
+	cached, lastSeq, purgeSeq, hit := s.cachedViewTotal(
+		ctx, db, vg.Sig, viewName, q.Partition, q.LastSeqHint, q.PurgeSeqHint,
+	)
 	batch := &pgx.Batch{}
 	scanCounts := func(pgx.Row) error { return nil }
 	switch {
@@ -346,7 +352,7 @@ func (s *Store) queryViewMap(ctx context.Context, db *DB, vg *ViewGroup, viewNam
 			return nil, err
 		}
 		if !hit {
-			s.storeViewTotal(db, vg.Sig, viewName, q.Partition, lastSeq, total)
+			s.storeViewTotal(db, vg.Sig, viewName, q.Partition, lastSeq, purgeSeq, total)
 		}
 	}
 	rows, err := br.Query()
@@ -390,7 +396,9 @@ func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewNa
 	// part is always constrained ('' on global views) so the scan index
 	// can bound on key_collate. It also provides partition scoping.
 	partCond, partArgs := " AND part = $2", []any{q.Partition}
-	if cached, lastSeq, hit := s.cachedViewTotal(ctx, db, vg.Sig, viewName, q.Partition, q.LastSeqHint); hit {
+	if cached, lastSeq, purgeSeq, hit := s.cachedViewTotal(
+		ctx, db, vg.Sig, viewName, q.Partition, q.LastSeqHint, q.PurgeSeqHint,
+	); hit {
 		result.TotalRows = cached
 	} else {
 		if err := s.pool.QueryRow(ctx, fmt.Sprintf(
@@ -399,7 +407,7 @@ func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewNa
 		).Scan(&result.TotalRows); err != nil {
 			return nil, err
 		}
-		s.storeViewTotal(db, vg.Sig, viewName, q.Partition, lastSeq, result.TotalRows)
+		s.storeViewTotal(db, vg.Sig, viewName, q.Partition, lastSeq, purgeSeq, result.TotalRows)
 	}
 	// Descending reverses the traversal. Keys use reverse request order,
 	// docids descending within each key.

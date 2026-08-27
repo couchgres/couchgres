@@ -28,9 +28,8 @@ type Store struct {
 	// traffic that comes with it. It is keyed by "<schema>/<sig>".
 	ensuredViews sync.Map
 	// viewTotals caches per-view row counts keyed "<schema>/<sig>/<view>/
-	// <part>". It is valid for one last_seq. Otherwise, total_rows requires a full
-	// view count on every read. Purge deletes view rows without
-	// bumping last_seq, so it clears the cache instead.
+	// <part>". Entries are valid for one (last_seq, purge_seq) generation;
+	// otherwise total_rows requires a full view count.
 	viewTotals sync.Map
 	// pendingCounts caches exact _changes pending counts against committed
 	// document and purge generations. It is bounded because clients control
@@ -64,34 +63,46 @@ func (s *Store) SetKeepSupersededBodies(keep bool) {
 }
 
 type viewTotal struct {
-	lastSeq int64
-	total   int64
+	lastSeq  int64
+	purgeSeq int64
+	total    int64
 }
 
 // cachedViewTotal returns the cached row count for one view when it is
-// still valid for the index's current last_seq. It also returns last_seq for
-// storage after a recount. lastSeqHint > 0 avoids the view_state read. During
-// a concurrent index update, the count can lag one batch. total_rows under
-// concurrent updates is approximate in CouchDB too.
-func (s *Store) cachedViewTotal(ctx context.Context, db *DB, sig, view, part string, lastSeqHint int64) (int64, int64, bool) {
-	lastSeq := lastSeqHint
-	if lastSeq <= 0 {
+// still valid for the index and purge generations. It also returns both
+// generations for storage after a recount. Hints from SyncViewGroupSnapshot
+// avoid another database read on the normal HTTP path. During a concurrent
+// index update, the count can lag one batch. total_rows under concurrent
+// updates is approximate in CouchDB too.
+func (s *Store) cachedViewTotal(
+	ctx context.Context,
+	db *DB,
+	sig, view, part string,
+	lastSeqHint int64,
+	purgeSeqHint *int64,
+) (total, lastSeq, purgeSeq int64, hit bool) {
+	lastSeq = lastSeqHint
+	if lastSeq <= 0 || purgeSeqHint == nil {
 		var err error
-		lastSeq, err = s.ViewGroupState(ctx, db, sig)
+		lastSeq, purgeSeq, err = s.ViewGroupSnapshot(ctx, db, sig)
 		if err != nil {
-			return 0, 0, false
+			return 0, 0, 0, false
 		}
+	} else {
+		purgeSeq = *purgeSeqHint
 	}
 	if e, ok := s.viewTotals.Load(viewTotalKey(db, sig, view, part)); ok {
-		if vt := e.(viewTotal); vt.lastSeq == lastSeq {
-			return vt.total, lastSeq, true
+		if vt := e.(viewTotal); vt.lastSeq == lastSeq && vt.purgeSeq == purgeSeq {
+			return vt.total, lastSeq, purgeSeq, true
 		}
 	}
-	return 0, lastSeq, false
+	return 0, lastSeq, purgeSeq, false
 }
 
-func (s *Store) storeViewTotal(db *DB, sig, view, part string, lastSeq, total int64) {
-	s.viewTotals.Store(viewTotalKey(db, sig, view, part), viewTotal{lastSeq: lastSeq, total: total})
+func (s *Store) storeViewTotal(db *DB, sig, view, part string, lastSeq, purgeSeq, total int64) {
+	s.viewTotals.Store(viewTotalKey(db, sig, view, part), viewTotal{
+		lastSeq: lastSeq, purgeSeq: purgeSeq, total: total,
+	})
 }
 
 func viewTotalKey(db *DB, sig, view, part string) string {
@@ -108,6 +119,11 @@ func (s *Store) clearViewCaches(db *DB) {
 		}
 		return true
 	})
+	s.clearViewTotals(db)
+}
+
+func (s *Store) clearViewTotals(db *DB) {
+	prefix := db.Schema + "/"
 	s.viewTotals.Range(func(k, _ any) bool {
 		if strings.HasPrefix(k.(string), prefix) {
 			s.viewTotals.Delete(k)

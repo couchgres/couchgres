@@ -24,6 +24,27 @@ ALTER TABLE couchgres.databases
     ADD COLUMN IF NOT EXISTS doc_counts_initialized boolean NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS update_seq bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS update_seq_initialized boolean NOT NULL DEFAULT false;
+
+-- Keep each view-state row on the database's durable purge generation.
+CREATE OR REPLACE FUNCTION couchgres.sync_view_purge_seq()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $view_purge_seq$
+BEGIN
+    IF NEW.purge_seq IS DISTINCT FROM OLD.purge_seq THEN
+        EXECUTE format(
+            'UPDATE %I.view_state SET purge_seq = GREATEST(purge_seq, $1)',
+            NEW.schema_name
+        ) USING NEW.purge_seq;
+    END IF;
+    RETURN NEW;
+END
+$view_purge_seq$;
+DROP TRIGGER IF EXISTS databases_sync_view_purge_seq ON couchgres.databases;
+CREATE TRIGGER databases_sync_view_purge_seq
+AFTER UPDATE OF purge_seq ON couchgres.databases
+FOR EACH ROW EXECUTE FUNCTION couchgres.sync_view_purge_seq();
+
 -- _all_dbs requires byte-order bounds and ordering regardless of the database's
 -- default collation. This expression index supports both scan directions.
 CREATE INDEX IF NOT EXISTS databases_name_c_idx
@@ -162,8 +183,9 @@ CREATE TABLE {s}.security (
 -- One row per design-doc signature. The per-signature data tables
 -- (v_<sig>) are created lazily when a view is first built.
 CREATE TABLE {s}.view_state (
-    sig      text PRIMARY KEY,
-    last_seq bigint NOT NULL DEFAULT 0
+    sig       text PRIMARY KEY,
+    last_seq  bigint NOT NULL DEFAULT 0,
+    purge_seq bigint NOT NULL DEFAULT 0
 );
 `
 

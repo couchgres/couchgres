@@ -14,9 +14,9 @@ import (
 // actually purged per doc (non-leaf and unknown revs are ignored, matching
 // CouchDB).
 func (s *Store) Purge(ctx context.Context, db *DB, requests map[string][]couch.Rev) (map[string][]couch.Rev, error) {
-	// Purging deletes view rows without advancing view last_seqs, so the
-	// cached per-view totals go stale.
-	defer s.clearViewCaches(db)
+	// Eagerly evict this process's derived view state. Other processes reject
+	// stale total-row entries through the durable purge generation.
+	defer s.clearViewTotals(db)
 	purged := make(map[string][]couch.Rev, len(requests))
 	for id, revs := range requests {
 		done, err := s.purgeDoc(ctx, db, id, revs)
@@ -182,8 +182,11 @@ func (s *Store) purgeFromViews(ctx context.Context, tx pgx.Tx, db *DB, id string
 	if !gone {
 		return nil
 	}
+	// View updaters lock their state row before changing indexed rows. Take the
+	// same lock order so the purge-generation trigger cannot invert those locks
+	// after this function deletes from the per-signature tables.
 	rows, err := tx.Query(ctx, fmt.Sprintf(
-		"SELECT sig FROM %s.view_state", db.Schema))
+		"SELECT sig FROM %s.view_state FOR UPDATE", db.Schema))
 	if err != nil {
 		return nil // No view_state table exists yet. Nothing to clean.
 	}

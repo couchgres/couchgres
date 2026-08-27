@@ -324,17 +324,20 @@ func (s *Server) viewImplPartition(w http.ResponseWriter, r *http.Request, body 
 		}
 	}
 	// Cached responses for a current index are byte-exact as long as neither
-	// the database nor the design doc moved. This takes one
+	// the database, purge generation, nor design doc moved. This takes one
 	// validation round trip instead of the whole read. Misses fall through
 	// to the normal path (and its normal error ordering).
 	upd := r.URL.Query().Get("update")
-	cacheable := r.Method == "GET" && body == nil && (upd == "" || upd == "true")
+	cacheable := r.Method == "GET" && body == nil && !r.URL.Query().Has("stale") &&
+		(upd == "" || upd == "true")
 	var cacheKey string
 	if cacheable {
 		cacheKey = r.URL.EscapedPath() + "?" + r.URL.RawQuery
 		if e := s.viewCache.get(cacheKey); e != nil {
 			if e.schema == db.Schema &&
-				s.store.ViewReadValid(r.Context(), db, e.ddocID, e.sig, e.ddocSeq, e.lastSeq) {
+				s.store.ViewReadValid(
+					r.Context(), db, e.ddocID, e.sig, e.ddocSeq, e.lastSeq, e.purgeSeq,
+				) {
 				return writeViewResponse(w, r, e.etag, e.body)
 			}
 			s.viewCache.drop(cacheKey)
@@ -349,6 +352,7 @@ func (s *Server) viewImplPartition(w http.ResponseWriter, r *http.Request, body 
 	if err != nil {
 		return err
 	}
+	cacheable = cacheable && req.update == "true"
 	if partition != "" {
 		if err := s.partitionQueryLimit(req.query.Limit); err != nil {
 			return err
@@ -358,20 +362,14 @@ func (s *Server) viewImplPartition(w http.ResponseWriter, r *http.Request, body 
 		}
 	}
 	req.query.Partition = partition
-	result, seq, err := s.runView(r, db, vg, r.PathValue("view"), req)
+	result, seq, purgeSeq, err := s.runView(r, db, vg, r.PathValue("view"), req)
 	if err != nil {
 		return err
 	}
 	// The view ETag covers the index state and the exact query. A matching
-	// If-None-Match short-circuits to 304. The update path already knows
-	// the index seq. Only stale-serving modes re-read it.
-	cacheable = cacheable && seq >= 0
-	if seq < 0 {
-		if seq, err = s.store.ViewGroupState(r.Context(), db, vg.Sig); err != nil {
-			return err
-		}
-	}
-	etag := viewETag(vg.Sig, r.PathValue("view"), seq, r.URL.RawQuery, body)
+	// If-None-Match short-circuits to 304. Both durable generations were
+	// captured before the row read.
+	etag := viewETag(vg.Sig, r.PathValue("view"), seq, purgeSeq, r.URL.RawQuery, body)
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return err
@@ -379,7 +377,7 @@ func (s *Server) viewImplPartition(w http.ResponseWriter, r *http.Request, body 
 	if cacheable {
 		s.viewCache.put(cacheKey, &viewRespEntry{
 			schema: db.Schema, ddocID: vg.DDocID, sig: vg.Sig, etag: etag,
-			ddocSeq: ddocSeq, lastSeq: seq, body: raw,
+			ddocSeq: ddocSeq, lastSeq: seq, purgeSeq: purgeSeq, body: raw,
 		})
 	}
 	return writeViewResponse(w, r, etag, raw)
@@ -406,9 +404,9 @@ func writeViewResponse(w http.ResponseWriter, r *http.Request, etag string, body
 
 // viewETag derives an opaque view response ETag from everything that can
 // change the response body.
-func viewETag(sig, view string, seq int64, rawQuery string, body map[string]any) string {
+func viewETag(sig, view string, seq, purgeSeq int64, rawQuery string, body map[string]any) string {
 	h := md5.New()
-	fmt.Fprintf(h, "%s/%s@%d?%s", sig, view, seq, rawQuery)
+	fmt.Fprintf(h, "%s/%s@%d/%d?%s", sig, view, seq, purgeSeq, rawQuery)
 	if body != nil {
 		raw, _ := json.Marshal(body)
 		h.Write(raw)
@@ -447,7 +445,7 @@ func (s *Server) viewQueries(w http.ResponseWriter, r *http.Request) error {
 		if err != nil {
 			return err
 		}
-		result, _, err := s.runView(r, db, vg, r.PathValue("view"), req)
+		result, _, _, err := s.runView(r, db, vg, r.PathValue("view"), req)
 		if err != nil {
 			return err
 		}
@@ -458,32 +456,48 @@ func (s *Server) viewQueries(w http.ResponseWriter, r *http.Request) error {
 }
 
 // runView updates the index per the update mode, executes the query, and
-// shapes the response object. The returned seq is the group's last_seq
-// when the update path learned it (-1 otherwise). Callers reuse it for
-// the response ETag.
-func (s *Server) runView(r *http.Request, db *store.DB, vg *store.ViewGroup, viewName string, req *viewRequest) (map[string]any, int64, error) {
+// shapes the response object. It captures the group's last_seq and the durable
+// purge generation before reading rows; callers reuse last_seq for the ETag,
+// while QueryView uses both generations for total-row cache validation.
+func (s *Server) runView(
+	r *http.Request,
+	db *store.DB,
+	vg *store.ViewGroup,
+	viewName string,
+	req *viewRequest,
+) (map[string]any, int64, int64, error) {
 	mapper, err := s.viewMapperFor(vg)
 	if err != nil {
-		return nil, -1, err
+		return nil, -1, 0, err
 	}
-	lastSeq := int64(-1)
+	var lastSeq, purgeSeq int64
 	switch req.update {
 	case "true":
-		lastSeq, err = s.store.SyncViewGroup(r.Context(), db, vg, mapper)
+		lastSeq, purgeSeq, err = s.store.SyncViewGroupSnapshot(r.Context(), db, vg, mapper)
 		if err != nil {
-			return nil, -1, err
+			return nil, -1, 0, err
 		}
-		req.query.LastSeqHint = lastSeq
 	case "lazy":
+		lastSeq, purgeSeq, err = s.store.ViewGroupSnapshot(r.Context(), db, vg.Sig)
+		if err != nil {
+			return nil, -1, 0, err
+		}
 		go func() {
 			// Bounded by server lifetime, not the request.
 			_ = s.store.UpdateViewGroup(s.lifetime, db, vg, mapper)
 		}()
+	default:
+		lastSeq, purgeSeq, err = s.store.ViewGroupSnapshot(r.Context(), db, vg.Sig)
+		if err != nil {
+			return nil, -1, 0, err
+		}
 	}
+	req.query.LastSeqHint = lastSeq
+	req.query.PurgeSeqHint = &purgeSeq
 	req.query.ReduceLimit = s.config.getBool("query_server_config", "reduce_limit", true)
 	result, err := s.store.QueryView(r.Context(), db, vg, viewName, req.query, s.reducer)
 	if err != nil {
-		return nil, -1, err
+		return nil, -1, 0, err
 	}
 
 	rows := make([]any, 0, len(result.Rows))
@@ -506,7 +520,7 @@ func (s *Server) runView(r *http.Request, db *store.DB, vg *store.ViewGroup, vie
 			} else {
 				doc := row.Doc.JSON()
 				if err := s.addAttachmentsMember(r, db, doc, row.Doc.ID, row.Doc.Rev, req.attachments); err != nil {
-					return nil, -1, err
+					return nil, -1, 0, err
 				}
 				if len(row.DocConflicts) > 0 {
 					doc["_conflicts"] = row.DocConflicts
@@ -524,7 +538,7 @@ func (s *Server) runView(r *http.Request, db *store.DB, vg *store.ViewGroup, vie
 	if req.query.UpdateSeq {
 		response["update_seq"] = seqString(result.UpdateSeq)
 	}
-	return response, lastSeq, nil
+	return response, lastSeq, purgeSeq, nil
 }
 
 // designInfo is GET /{db}/_design/{ddoc}/_info.

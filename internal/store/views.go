@@ -226,8 +226,9 @@ func (s *Store) ensureViewTables(ctx context.Context, db *DB, sig string) error 
 	table := viewTable(sig)
 	ddl := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %[1]s.view_state (
-    sig      text PRIMARY KEY,
-    last_seq bigint NOT NULL DEFAULT 0
+    sig       text PRIMARY KEY,
+    last_seq  bigint NOT NULL DEFAULT 0,
+    purge_seq bigint NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS %[1]s.%[2]s (
     view_name   text NOT NULL,
@@ -246,7 +247,9 @@ CREATE INDEX IF NOT EXISTS %[2]s_doc ON %[1]s.%[2]s (doc_id);
 		return err
 	}
 	if _, err := s.pool.Exec(ctx, fmt.Sprintf(
-		"INSERT INTO %s.view_state (sig) VALUES ($1) ON CONFLICT DO NOTHING", db.Schema), sig); err != nil {
+		`INSERT INTO %s.view_state (sig, purge_seq)
+		 SELECT $1, purge_seq FROM couchgres.databases WHERE name = $2 FOR SHARE
+		 ON CONFLICT (sig) DO NOTHING`, db.Schema), sig, db.Name); err != nil {
 		return err
 	}
 	s.ensuredViews.Store(cacheKey, struct{}{})
@@ -280,8 +283,22 @@ func (s *Store) UpdateViewGroup(ctx context.Context, db *DB, vg *ViewGroup, mapp
 // read path uses it for ETags and total-cache validation. The currency check
 // provides it and saves two round trips per query.
 func (s *Store) SyncViewGroup(ctx context.Context, db *DB, vg *ViewGroup, mapper ViewMapper) (int64, error) {
+	lastSeq, _, err := s.SyncViewGroupSnapshot(ctx, db, vg, mapper)
+	return lastSeq, err
+}
+
+// SyncViewGroupSnapshot updates the group and captures its last_seq together
+// with the database purge generation before the caller reads view rows. Purges
+// remove rows without advancing last_seq, so both values define a reusable
+// view-read snapshot.
+func (s *Store) SyncViewGroupSnapshot(
+	ctx context.Context,
+	db *DB,
+	vg *ViewGroup,
+	mapper ViewMapper,
+) (int64, int64, error) {
 	if err := s.ensureViewTables(ctx, db, vg.Sig); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	// Fast path. Most queries find the index current. A lockless read avoids
 	// opening the batch transaction. SELECT ... FOR UPDATE writes a row-lock
@@ -289,31 +306,40 @@ func (s *Store) SyncViewGroup(ctx context.Context, db *DB, vg *ViewGroup, mapper
 	// between this check and the query was equally invisible to the old
 	// locked read. Semantics are unchanged.
 	var lastSeq int64
+	var purgeSeq int64
 	var current bool
 	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT last_seq, last_seq >= coalesce(
-		   (SELECT seq FROM %[1]s.docs ORDER BY seq DESC LIMIT 1), 0)
-		 FROM %[1]s.view_state WHERE sig = $1`, db.Schema), vg.Sig,
-	).Scan(&lastSeq, &current); err == nil && current {
-		return lastSeq, nil
+		`SELECT v.last_seq, v.last_seq >= coalesce(
+		   (SELECT seq FROM %[1]s.docs ORDER BY seq DESC LIMIT 1), 0),
+		   v.purge_seq
+		 FROM %[1]s.view_state v
+		 WHERE v.sig = $1`, db.Schema), vg.Sig,
+	).Scan(&lastSeq, &current, &purgeSeq); err == nil && current {
+		return lastSeq, purgeSeq, nil
 	}
 	if err := s.updateViewGroupSlow(ctx, db, vg, mapper); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return s.ViewGroupState(ctx, db, vg.Sig)
+	return s.ViewGroupSnapshot(ctx, db, vg.Sig)
 }
 
-// ViewReadValid reports whether a view response captured at (ddocSeq,
-// lastSeq) is still byte-exact. It requires the same design document revision,
-// the same index state, and an index current with the database. This takes one
-// round trip on the response cache fast path.
-func (s *Store) ViewReadValid(ctx context.Context, db *DB, ddocID, sig string, ddocSeq, lastSeq int64) bool {
+// ViewReadValid reports whether a view response captured at (ddocSeq, lastSeq,
+// purgeSeq) is still byte-exact. It requires the same design document revision,
+// index state, and purge generation, plus an index current with the database.
+// This takes one round trip on the response-cache fast path.
+func (s *Store) ViewReadValid(
+	ctx context.Context,
+	db *DB,
+	ddocID, sig string,
+	ddocSeq, lastSeq, purgeSeq int64,
+) bool {
 	var ok bool
 	err := s.pool.QueryRow(ctx, fmt.Sprintf(
 		`SELECT coalesce((SELECT seq FROM %[1]s.docs WHERE id = $1), -1) = $2
-		    AND coalesce((SELECT last_seq FROM %[1]s.view_state WHERE sig = $3), -1) = $4
-		    AND $4 >= coalesce((SELECT seq FROM %[1]s.docs ORDER BY seq DESC LIMIT 1), 0)`,
-		db.Schema), ddocID, ddocSeq, sig, lastSeq).Scan(&ok)
+		    AND EXISTS (SELECT 1 FROM %[1]s.view_state
+		                WHERE sig = $3 AND last_seq = $4 AND purge_seq = $5)
+		    AND $4 >= coalesce((SELECT seq FROM %[1]s.docs ORDER BY seq DESC LIMIT 1), 0)
+		`, db.Schema), ddocID, ddocSeq, sig, lastSeq, purgeSeq).Scan(&ok)
 	return err == nil && ok
 }
 
@@ -352,7 +378,7 @@ func (s *Store) updateViewGroupSlow(ctx context.Context, db *DB, vg *ViewGroup, 
 			}
 			return nil
 		}
-	// Only a build with more batches coming pays for statistics. The
+		// Only a build with more batches coming pays for statistics. The
 		// per-query no-op update check never reaches here.
 		if batches%8 == 0 {
 			analyze()
@@ -751,6 +777,20 @@ func (s *Store) ViewGroupState(ctx context.Context, db *DB, sig string) (int64, 
 		return 0, nil // Missing table or row. Never built.
 	}
 	return lastSeq, nil
+}
+
+// ViewGroupSnapshot returns the index and purge generations in one database
+// snapshot. A missing state row is an unbuilt view at sequence zero.
+func (s *Store) ViewGroupSnapshot(ctx context.Context, db *DB, sig string) (int64, int64, error) {
+	var lastSeq, purgeSeq int64
+	err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		"SELECT last_seq, purge_seq FROM %s.view_state WHERE sig = $1", db.Schema), sig,
+	).Scan(&lastSeq, &purgeSeq)
+	if err == pgx.ErrNoRows {
+		purgeSeq, err = s.PurgeSeq(ctx, db)
+		return 0, purgeSeq, err
+	}
+	return lastSeq, purgeSeq, err
 }
 
 // ViewGroupSize reports the on-disk size of the group's table (for _info).

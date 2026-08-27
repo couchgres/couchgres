@@ -52,8 +52,8 @@ func (s *Server) purge(w http.ResponseWriter, r *http.Request) error {
 		}
 		requests[id] = revs
 	}
-	// Purge deletes view rows without moving any sequence. The response
-	// cache can't see it, so clear the database's entries.
+	// Eagerly evict this process's entries. Other processes validate the
+	// durable purge generation before reusing their cached view responses.
 	s.viewCache.clearSchema(db.Schema)
 	purged, err := s.store.Purge(r.Context(), db, requests)
 	if err != nil {
