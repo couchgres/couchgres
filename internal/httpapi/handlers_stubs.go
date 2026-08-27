@@ -161,6 +161,7 @@ func (s *Server) nodeStats(w http.ResponseWriter, r *http.Request) error {
 		return map[string]any{"value": value, "type": kind, "desc": desc}
 	}
 	js := s.js.Stats()
+	body := s.bodyLimiter.stats()
 	writeJSON(w, 200, map[string]any{
 		"couchdb": map[string]any{
 			"request_time": map[string]any{"value": map[string]any{"min": 0, "max": 0, "arithmetic_mean": 0, "n": 0}, "type": "histogram", "desc": "length of a request inside CouchDB without MochiWeb"},
@@ -185,6 +186,24 @@ func (s *Server) nodeStats(w http.ResponseWriter, r *http.Request) error {
 		"rexi":             map[string]any{},
 		"fsync":            map[string]any{},
 		"couchgres": map[string]any{
+			"request_bodies": map[string]any{
+				"budget_bytes":               metric(body.BudgetBytes, "gauge", "global upload admission budget in bytes"),
+				"principal_budget_bytes":     metric(body.PrincipalBudgetBytes, "gauge", "per-principal upload admission budget in bytes"),
+				"reservation_bytes":          metric(body.ReservationBytes, "gauge", "minimum upload reservation in bytes"),
+				"active_bytes":               metric(body.ActiveBytes, "gauge", "bytes reserved by active uploads"),
+				"active_requests":            metric(body.ActiveRequests, "gauge", "active upload requests"),
+				"queue_limit":                metric(body.QueueLimit, "gauge", "maximum queued upload requests"),
+				"principal_queue_limit":      metric(body.PrincipalQueueLimit, "gauge", "maximum queued uploads per principal"),
+				"queue_timeout_milliseconds": metric(body.QueueTimeoutMillis, "gauge", "maximum upload admission wait"),
+				"queued_requests":            metric(body.QueuedRequests, "gauge", "upload requests waiting for admission"),
+				"max_queued_requests":        metric(body.MaxQueuedRequests, "gauge", "high-water mark of queued upload requests"),
+				"admitted_requests":          metric(body.AdmittedRequests, "counter", "upload requests admitted"),
+				"waited_requests":            metric(body.WaitedRequests, "counter", "queued upload requests eventually admitted"),
+				"rejected_requests":          metric(body.RejectedRequests, "counter", "upload requests rejected by admission control"),
+				"timed_out_requests":         metric(body.TimedOutRequests, "counter", "upload requests whose admission wait expired"),
+				"canceled_requests":          metric(body.CanceledRequests, "counter", "queued uploads canceled by their clients"),
+				"queue_wait_microseconds":    metric(body.QueueWaitMicros, "counter", "cumulative upload admission wait in microseconds"),
+			},
 			"javascript": map[string]any{
 				"workers":             metric(js.Workers, "gauge", "JavaScript worker count"),
 				"queued":              metric(js.Queued, "gauge", "calls waiting for a JavaScript worker"),

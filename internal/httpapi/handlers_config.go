@@ -131,9 +131,12 @@ func (s *Server) configDelete(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// applyStoreConfig mirrors config-tree settings the storage layer acts on.
-// called at startup and after every config write.
+// applyStoreConfig mirrors config-tree settings into long-lived runtime
+// components. It is called at startup and after every config write or reload.
 func (s *Server) applyStoreConfig() {
 	s.store.SetKeepSupersededBodies(
 		s.config.getBool("couchgres", "keep_superseded_bodies", false))
+	bodyLimits := s.config.requestBodyLimits()
+	s.bodyLimiter.configure(defaultRequestBodyLimiterConfig(
+		bodyLimits.maxUpload()))
 }

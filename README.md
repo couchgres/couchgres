@@ -88,24 +88,19 @@ CouchDB-style settings are stored in PostgreSQL and exposed through `/_node/_loc
 | `chttpd/secure_rewrites`                                                  | Defaults to `true`, restricting array and function rewrites to the source database and original HTTP method. With `false`, cross-scope or method-changing rewrites still require a server administrator.                |
 | `couchgres_httpd/max_{small,query,document,bulk,attachment}_request_size` | Route-specific request-body ceilings. Defaults to 64 KiB, 1 MiB, 16 MiB, 64 MiB, and 64 MiB respectively; the global ceiling always wins.                                                                               |
 
-When proxy authentication is enabled, the edge proxy must remove all incoming
-configured username, roles, and token headers before setting its own values.
-Unsigned mode is intended only for tightly controlled deployments: Couchgres
-matches `proxy_trusted_cidrs` against the direct socket peer (`RemoteAddr`) and
-never trusts `X-Forwarded-For` to establish proxy identity. Prefer signed mode
-even on private networks.
+When proxy authentication is enabled, the edge proxy must remove all incoming configured username, roles, and token headers before setting its own values. Unsigned mode is intended only for tightly controlled deployments: Couchgres matches `proxy_trusted_cidrs` against the direct socket peer (`RemoteAddr`) and never trusts `X-Forwarded-For` to establish proxy identity. Prefer signed mode even on private networks.
+
+### Upload admission
+
+Document, bulk-document, and attachment bodies share a 256 MiB byte-weighted admission budget instead of a fixed request-count limit. Known-length bodies reserve their declared length in 64 KiB units; chunked and otherwise unknown-length bodies reserve their route's full size ceiling. Each principal normally receives a 64 MiB share (automatically raised so one administratively permitted upload always fits), and short bursts may wait up to 250 ms in a bounded, per-principal-fair queue before receiving HTTP 503.
+
+Live budgets, active and queued reservations, queue high-water marks, waits, timeouts, cancellations, and rejections are available to server administrators under `couchgres.request_bodies` in `GET /_node/_local/_stats`.
 
 ### JavaScript resource limits
 
-Design-document JavaScript runs in a pool of at most four QuickJS workers by
-default. Each worker retains at most four least-recently-used contexts and 8 MiB
-of estimated design source. Every VM has a 64 MiB heap ceiling, and each call is
-limited to 16 MiB of serialized output and 100,000 emitted view rows. Evicted,
-oversized, and memory-exhausted contexts are closed rather than retained.
+Design-document JavaScript runs in a pool of at most four QuickJS workers by default. Each worker retains at most four least-recently-used contexts and 8 MiB of estimated design source. Every VM has a 64 MiB heap ceiling, and each call is limited to 16 MiB of serialized output and 100,000 emitted view rows. Evicted, oversized, and memory-exhausted contexts are closed rather than retained.
 
-Live worker, queue, cache, eviction, timeout, memory-limit, and output-limit
-counters are available to server administrators under `couchgres.javascript`
-in `GET /_node/_local/_stats`.
+Live worker, queue, cache, eviction, timeout, memory-limit, and output-limit counters are available to server administrators under `couchgres.javascript` in `GET /_node/_local/_stats`.
 
 ## Performance and Benchmarks
 

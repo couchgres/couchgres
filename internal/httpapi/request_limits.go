@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"runtime"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/couchgres/couchgres/internal/couch"
 )
@@ -20,6 +20,13 @@ const (
 	defaultMaxBulkBodySize    = int64(64 << 20)
 	defaultMaxAttachmentSize  = int64(64 << 20)
 	hardMaxHTTPRequestSize    = int64(256 << 20)
+
+	defaultRequestBodyBudget       = int64(256 << 20)
+	defaultPrincipalBodyBudget     = int64(64 << 20)
+	defaultRequestBodyReservation  = int64(64 << 10)
+	defaultRequestBodyQueueLimit   = 128
+	defaultPrincipalBodyQueueLimit = 32
+	defaultRequestBodyQueueTimeout = 250 * time.Millisecond
 )
 
 type requestBodyClass uint8
@@ -123,6 +130,11 @@ func (l requestBodyLimits) forClass(class requestBodyClass) int64 {
 	return limit
 }
 
+func (l requestBodyLimits) maxUpload() int64 {
+	return max(l.forClass(bodyDocument), l.forClass(bodyBulk),
+		l.forClass(bodyAttachment))
+}
+
 func classifyRequestBody(r *http.Request, pattern string) requestBodyClass {
 	switch pattern {
 	case "POST /_session",
@@ -148,7 +160,8 @@ func classifyRequestBody(r *http.Request, pattern string) requestBodyClass {
 }
 
 // protectRequestBody applies the tighter of the global and route-class limit.
-// Expensive upload routes also share global and per-principal work slots.
+// Expensive upload routes also share byte-weighted global and per-principal
+// admission budgets.
 func (s *Server) protectRequestBody(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -161,10 +174,12 @@ func (s *Server) protectRequestBody(
 		return nil, false
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
-	if !class.expensive() || (r.ContentLength == 0 && r.TransferEncoding == nil) {
+	if !class.expensive() {
 		return func() {}, true
 	}
-	release, err := s.bodyLimiter.acquire(r.Context(), requestPrincipal(r))
+	reservation := requestBodyReservation(r, limit)
+	release, err := s.bodyLimiter.acquire(
+		r.Context(), requestPrincipal(r), reservation)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			w.Header().Set("Retry-After", "1")
@@ -188,77 +203,359 @@ func requestPrincipal(r *http.Request) string {
 }
 
 type principalBodyLimit struct {
-	slots chan struct{}
-	refs  int
+	activeBytes    int64
+	activeRequests int64
+	queuedRequests int64
+}
+
+type requestBodyWaiter struct {
+	principal string
+	bytes     int64
+	queuedAt  time.Time
+	ready     chan struct{}
+	queued    bool
+	granted   bool
+}
+
+type requestBodyLimiterConfig struct {
+	budgetBytes          int64
+	principalBudgetBytes int64
+	queueLimit           int
+	principalQueueLimit  int
+	queueTimeout         time.Duration
+}
+
+type requestBodyLimiterStats struct {
+	BudgetBytes          int64
+	PrincipalBudgetBytes int64
+	ReservationBytes     int64
+	ActiveBytes          int64
+	ActiveRequests       int64
+	QueueLimit           int64
+	PrincipalQueueLimit  int64
+	QueueTimeoutMillis   int64
+	QueuedRequests       int64
+	MaxQueuedRequests    int64
+	AdmittedRequests     uint64
+	WaitedRequests       uint64
+	RejectedRequests     uint64
+	TimedOutRequests     uint64
+	CanceledRequests     uint64
+	QueueWaitMicros      uint64
 }
 
 // requestBodyLimiter bounds aggregate upload buffering and prevents one
-// authenticated principal or anonymous source from taking every global slot.
+// authenticated principal or anonymous source from taking the process budget.
+// Waiters are globally FIFO, except that a principal at its own byte limit is
+// skipped so it cannot head-of-line block other principals.
 type requestBodyLimiter struct {
-	global       chan struct{}
-	perPrincipal int
-	mu           sync.Mutex
-	principals   map[string]*principalBodyLimit
+	mu                sync.Mutex
+	config            requestBodyLimiterConfig
+	activeBytes       int64
+	activeRequests    int64
+	queuedRequests    int64
+	maxQueuedRequests int64
+	admittedRequests  uint64
+	waitedRequests    uint64
+	rejectedRequests  uint64
+	timedOutRequests  uint64
+	canceledRequests  uint64
+	queueWaitMicros   uint64
+	principals        map[string]*principalBodyLimit
+	waiters           []*requestBodyWaiter
 }
 
 var errRequestBodyBusy = errors.New("too many concurrent request bodies")
 
 func newRequestBodyLimiter() *requestBodyLimiter {
-	global := runtime.GOMAXPROCS(0)
-	if global > 4 {
-		global = 4
+	return newRequestBodyLimiterWithConfig(
+		defaultRequestBodyLimiterConfig(defaultMaxHTTPRequestSize))
+}
+
+func defaultRequestBodyLimiterConfig(maxUploadBytes int64) requestBodyLimiterConfig {
+	principalBudget := defaultPrincipalBodyBudget
+	if maxUploadBytes > principalBudget {
+		// Any body permitted by an effective upload-route limit must fit by
+		// itself. Raising that limit intentionally reduces per-principal
+		// concurrency for large bodies rather than making it unusable.
+		principalBudget = maxUploadBytes
 	}
-	if global < 1 {
-		global = 1
-	}
-	perPrincipal := 2
-	if global == 1 {
-		perPrincipal = 1
-	}
-	return &requestBodyLimiter{
-		global:       make(chan struct{}, global),
-		perPrincipal: perPrincipal,
-		principals:   make(map[string]*principalBodyLimit),
+	return requestBodyLimiterConfig{
+		budgetBytes:          defaultRequestBodyBudget,
+		principalBudgetBytes: principalBudget,
+		queueLimit:           defaultRequestBodyQueueLimit,
+		principalQueueLimit:  defaultPrincipalBodyQueueLimit,
+		queueTimeout:         defaultRequestBodyQueueTimeout,
 	}
 }
 
-func (l *requestBodyLimiter) acquire(ctx context.Context, principal string) (func(), error) {
+func newRequestBodyLimiterWithConfig(config requestBodyLimiterConfig) *requestBodyLimiter {
+	l := &requestBodyLimiter{principals: make(map[string]*principalBodyLimit)}
+	l.configure(config)
+	return l
+}
+
+func (l *requestBodyLimiter) configure(config requestBodyLimiterConfig) {
+	if config.budgetBytes < 1 {
+		config.budgetBytes = 1
+	}
+	if config.principalBudgetBytes < 1 {
+		config.principalBudgetBytes = 1
+	}
+	if config.principalBudgetBytes > config.budgetBytes {
+		config.principalBudgetBytes = config.budgetBytes
+	}
+	if config.queueLimit < 0 {
+		config.queueLimit = 0
+	}
+	if config.principalQueueLimit < 0 {
+		config.principalQueueLimit = 0
+	}
+	if config.principalQueueLimit > config.queueLimit {
+		config.principalQueueLimit = config.queueLimit
+	}
+	if config.queueTimeout < 0 {
+		config.queueTimeout = 0
+	}
+	l.mu.Lock()
+	l.config = config
+	l.dispatchLocked()
+	l.mu.Unlock()
+}
+
+func requestBodyReservation(r *http.Request, limit int64) int64 {
+	bytes := r.ContentLength
+	if bytes < 0 || len(r.TransferEncoding) > 0 {
+		// An unknown-length stream could reach the route ceiling, so account
+		// for all of it before a handler starts reading.
+		bytes = limit
+	}
+	if bytes < defaultRequestBodyReservation {
+		bytes = defaultRequestBodyReservation
+	}
+	if remainder := bytes % defaultRequestBodyReservation; remainder != 0 {
+		bytes += defaultRequestBodyReservation - remainder
+	}
+	return bytes
+}
+
+func (l *requestBodyLimiter) acquire(
+	ctx context.Context,
+	principal string,
+	bytes int64,
+) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	l.mu.Lock()
-	p := l.principals[principal]
-	if p == nil {
-		p = &principalBodyLimit{slots: make(chan struct{}, l.perPrincipal)}
-		l.principals[principal] = p
+	if bytes < 1 {
+		bytes = 1
 	}
-	p.refs++
+	l.mu.Lock()
+	if bytes > l.config.budgetBytes || bytes > l.config.principalBudgetBytes {
+		l.rejectedRequests++
+		l.mu.Unlock()
+		return nil, errRequestBodyBusy
+	}
+	p := l.principalLocked(principal)
+	if len(l.waiters) == 0 && l.canGrantLocked(p, bytes) {
+		l.grantLocked(p, bytes, false, 0)
+		l.mu.Unlock()
+		return l.releaseFunc(principal, bytes), nil
+	}
+	if int(l.queuedRequests) >= l.config.queueLimit ||
+		int(p.queuedRequests) >= l.config.principalQueueLimit ||
+		l.config.queueTimeout == 0 {
+		l.rejectedRequests++
+		l.cleanupPrincipalLocked(principal, p)
+		l.mu.Unlock()
+		return nil, errRequestBodyBusy
+	}
+	waiter := &requestBodyWaiter{
+		principal: principal,
+		bytes:     bytes,
+		queuedAt:  time.Now(),
+		ready:     make(chan struct{}),
+		queued:    true,
+	}
+	l.waiters = append(l.waiters, waiter)
+	p.queuedRequests++
+	l.queuedRequests++
+	if l.queuedRequests > l.maxQueuedRequests {
+		l.maxQueuedRequests = l.queuedRequests
+	}
+	l.dispatchLocked()
+	if waiter.granted {
+		l.mu.Unlock()
+		return l.releaseFunc(principal, bytes), nil
+	}
+	timeout := l.config.queueTimeout
 	l.mu.Unlock()
 
-	cleanup := func() {
-		l.mu.Lock()
-		p.refs--
-		if p.refs == 0 {
-			delete(l.principals, principal)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-waiter.ready:
+		if err := ctx.Err(); err != nil {
+			l.release(principal, bytes)
+			return nil, err
 		}
-		l.mu.Unlock()
-	}
-	select {
-	case p.slots <- struct{}{}:
-	default:
-		cleanup()
+		return l.releaseFunc(principal, bytes), nil
+	case <-ctx.Done():
+		if l.cancelWaiter(waiter, false) {
+			l.release(principal, bytes)
+		}
+		return nil, ctx.Err()
+	case <-timer.C:
+		if l.cancelWaiter(waiter, true) {
+			return l.releaseFunc(principal, bytes), nil
+		}
 		return nil, errRequestBodyBusy
 	}
-	select {
-	case l.global <- struct{}{}:
-	default:
-		<-p.slots
-		cleanup()
-		return nil, errRequestBodyBusy
+}
+
+func (l *requestBodyLimiter) principalLocked(principal string) *principalBodyLimit {
+	p := l.principals[principal]
+	if p == nil {
+		p = &principalBodyLimit{}
+		l.principals[principal] = p
 	}
+	return p
+}
+
+func (l *requestBodyLimiter) canGrantLocked(p *principalBodyLimit, bytes int64) bool {
+	return l.activeBytes+bytes <= l.config.budgetBytes &&
+		p.activeBytes+bytes <= l.config.principalBudgetBytes
+}
+
+func (l *requestBodyLimiter) grantLocked(
+	p *principalBodyLimit,
+	bytes int64,
+	waited bool,
+	wait time.Duration,
+) {
+	l.activeBytes += bytes
+	l.activeRequests++
+	p.activeBytes += bytes
+	p.activeRequests++
+	l.admittedRequests++
+	if waited {
+		l.waitedRequests++
+		l.queueWaitMicros += uint64(wait.Microseconds())
+	}
+}
+
+func (l *requestBodyLimiter) dispatchLocked() {
+	for len(l.waiters) > 0 {
+		granted := false
+		for i, waiter := range l.waiters {
+			if l.activeBytes+waiter.bytes > l.config.budgetBytes {
+				// Preserve global FIFO when byte pressure is the reason a
+				// request cannot proceed, preventing large-body starvation.
+				return
+			}
+			p := l.principals[waiter.principal]
+			if p.activeBytes+waiter.bytes > l.config.principalBudgetBytes {
+				// A saturated principal must not block a different one.
+				continue
+			}
+			l.waiters = append(l.waiters[:i], l.waiters[i+1:]...)
+			waiter.queued = false
+			waiter.granted = true
+			p.queuedRequests--
+			l.queuedRequests--
+			l.grantLocked(p, waiter.bytes, true, time.Since(waiter.queuedAt))
+			close(waiter.ready)
+			granted = true
+			break
+		}
+		if !granted {
+			return
+		}
+	}
+}
+
+// cancelWaiter returns true when the waiter won the grant race and therefore
+// owns a reservation that its caller must release.
+func (l *requestBodyLimiter) cancelWaiter(waiter *requestBodyWaiter, timedOut bool) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if waiter.granted {
+		return true
+	}
+	if !waiter.queued {
+		return false
+	}
+	for i, queued := range l.waiters {
+		if queued == waiter {
+			l.waiters = append(l.waiters[:i], l.waiters[i+1:]...)
+			break
+		}
+	}
+	waiter.queued = false
+	p := l.principals[waiter.principal]
+	p.queuedRequests--
+	l.queuedRequests--
+	if timedOut {
+		l.timedOutRequests++
+		l.rejectedRequests++
+	} else {
+		l.canceledRequests++
+	}
+	l.queueWaitMicros += uint64(time.Since(waiter.queuedAt).Microseconds())
+	l.cleanupPrincipalLocked(waiter.principal, p)
+	l.dispatchLocked()
+	return false
+}
+
+func (l *requestBodyLimiter) releaseFunc(principal string, bytes int64) func() {
+	var once sync.Once
 	return func() {
-		<-l.global
-		<-p.slots
-		cleanup()
-	}, nil
+		once.Do(func() { l.release(principal, bytes) })
+	}
+}
+
+func (l *requestBodyLimiter) release(principal string, bytes int64) {
+	l.mu.Lock()
+	p := l.principals[principal]
+	if p != nil {
+		p.activeBytes -= bytes
+		p.activeRequests--
+	}
+	l.activeBytes -= bytes
+	l.activeRequests--
+	l.cleanupPrincipalLocked(principal, p)
+	l.dispatchLocked()
+	l.mu.Unlock()
+}
+
+func (l *requestBodyLimiter) cleanupPrincipalLocked(
+	principal string,
+	p *principalBodyLimit,
+) {
+	if p != nil && p.activeRequests == 0 && p.queuedRequests == 0 {
+		delete(l.principals, principal)
+	}
+}
+
+func (l *requestBodyLimiter) stats() requestBodyLimiterStats {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return requestBodyLimiterStats{
+		BudgetBytes:          l.config.budgetBytes,
+		PrincipalBudgetBytes: l.config.principalBudgetBytes,
+		ReservationBytes:     defaultRequestBodyReservation,
+		ActiveBytes:          l.activeBytes,
+		ActiveRequests:       l.activeRequests,
+		QueueLimit:           int64(l.config.queueLimit),
+		PrincipalQueueLimit:  int64(l.config.principalQueueLimit),
+		QueueTimeoutMillis:   l.config.queueTimeout.Milliseconds(),
+		QueuedRequests:       l.queuedRequests,
+		MaxQueuedRequests:    l.maxQueuedRequests,
+		AdmittedRequests:     l.admittedRequests,
+		WaitedRequests:       l.waitedRequests,
+		RejectedRequests:     l.rejectedRequests,
+		TimedOutRequests:     l.timedOutRequests,
+		CanceledRequests:     l.canceledRequests,
+		QueueWaitMicros:      l.queueWaitMicros,
+	}
 }

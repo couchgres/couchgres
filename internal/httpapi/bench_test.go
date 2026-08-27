@@ -11,10 +11,57 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime"
+	"sync/atomic"
 	"testing"
 
 	"github.com/couchgres/couchgres/internal/store"
 )
+
+// BenchmarkRequestBodyAdmission measures the byte-weighted fast and queued
+// paths for the body sizes called out by PERF2-04, from one principal and from
+// many. It is database-independent so admission changes remain cheap to track.
+func BenchmarkRequestBodyAdmission(b *testing.B) {
+	sizes := []struct {
+		name  string
+		bytes int64
+	}{
+		{name: "1KiB", bytes: 1 << 10},
+		{name: "64KiB", bytes: 64 << 10},
+		{name: "1MiB", bytes: 1 << 20},
+		{name: "maximum", bytes: defaultMaxHTTPRequestSize},
+	}
+	for _, principalCount := range []int{1, 16} {
+		for _, size := range sizes {
+			b.Run(fmt.Sprintf("principals=%d/size=%s", principalCount, size.name), func(b *testing.B) {
+				if principalCount > 1 {
+					b.SetParallelism(max(1,
+						(principalCount+runtime.GOMAXPROCS(0)-1)/runtime.GOMAXPROCS(0)))
+				}
+				limiter := newRequestBodyLimiter()
+				principals := make([]string, principalCount)
+				for i := range principals {
+					principals[i] = fmt.Sprintf("benchmark-%d", i)
+				}
+				weight := requestBodyReservation(
+					&http.Request{ContentLength: size.bytes}, defaultMaxHTTPRequestSize)
+				var worker atomic.Uint64
+				b.ReportMetric(float64(weight), "reserved_bytes/op")
+				b.RunParallel(func(pb *testing.PB) {
+					principal := principals[int(worker.Add(1)-1)%len(principals)]
+					for pb.Next() {
+						release, err := limiter.acquire(b.Context(), principal, weight)
+						if err != nil {
+							b.Errorf("acquire: %v", err)
+							return
+						}
+						release()
+					}
+				})
+			})
+		}
+	}
+}
 
 // benchDocs bulk-inserts n small docs shaped for the benchmark views.
 func benchDocs(b *testing.B, h http.Handler, db string, n int) {
