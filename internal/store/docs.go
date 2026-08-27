@@ -14,11 +14,12 @@ import (
 // DocRow is a stored document revision. It includes metadata and the body map
 // (which never contains underscore members).
 type DocRow struct {
-	ID      string
-	Rev     couch.Rev
-	Deleted bool
-	Body    map[string]any
-	Seq     int64
+	ID           string
+	Rev          couch.Rev
+	Deleted      bool
+	Body         map[string]any
+	Seq          int64
+	externalSize int64
 }
 
 // JSON assembles the client-visible document object.
@@ -69,6 +70,38 @@ func (s *Store) PutDoc(
 	deleted bool,
 	atts []AttachmentWrite,
 ) (couch.Rev, int64, error) {
+	return s.putDoc(ctx, db, id, body, rawBody, expected, deleted, atts, -1)
+}
+
+// PutDocWithLimit performs an interactive write and transactionally enforces
+// maxPartitionSize. The write that first crosses the limit is allowed; later
+// growth is rejected until deletes or shrinking updates bring the partition
+// back below it.
+func (s *Store) PutDocWithLimit(
+	ctx context.Context,
+	db *DB,
+	id string,
+	body map[string]any,
+	rawBody []byte,
+	expected *couch.Rev,
+	deleted bool,
+	atts []AttachmentWrite,
+	maxPartitionSize int64,
+) (couch.Rev, int64, error) {
+	return s.putDoc(ctx, db, id, body, rawBody, expected, deleted, atts, maxPartitionSize)
+}
+
+func (s *Store) putDoc(
+	ctx context.Context,
+	db *DB,
+	id string,
+	body map[string]any,
+	rawBody []byte,
+	expected *couch.Rev,
+	deleted bool,
+	atts []AttachmentWrite,
+	maxPartitionSize int64,
+) (couch.Rev, int64, error) {
 	fail := func(err error) (couch.Rev, int64, error) { return couch.Rev{}, 0, err }
 
 	tx, err := s.pool.Begin(ctx)
@@ -95,11 +128,12 @@ func (s *Store) PutDoc(
 		return fail(couch.Conflict())
 	}
 
+	canonical := couch.CanonicalBody(body)
 	raw := rawBody
 	if raw == nil {
-		raw = couch.CanonicalBody(body)
+		raw = canonical
 	}
-	revAtts, err := revAttsForWrite(ctx, tx, db, id, parent, atts)
+	revAtts, attachmentSize, err := revAttsForWrite(ctx, tx, db, id, parent, atts)
 	if err != nil {
 		return fail(err)
 	}
@@ -107,7 +141,29 @@ func (s *Store) PutDoc(
 	if err != nil {
 		return fail(err)
 	}
-	if err := insertLeaf(ctx, tx, db, id, rev, parent, deleted, body,
+	externalSize := int64(0)
+	if !deleted {
+		externalSize = int64(len(canonical)) + attachmentSize
+	}
+	oldExternalSize := int64(0)
+	if found {
+		oldExternalSize = winner.externalSize
+	}
+	if partition, ok := partitionForWrite(db, id); ok && externalSize > oldExternalSize {
+		if err := lockPartitionWrites(ctx, tx, db, []string{partition}); err != nil {
+			return fail(err)
+		}
+		if maxPartitionSize >= 0 {
+			sizes, err := partitionSizesTx(ctx, tx, db, []string{partition})
+			if err != nil {
+				return fail(err)
+			}
+			if sizes[partition] >= maxPartitionSize {
+				return fail(partitionOverflow(id))
+			}
+		}
+	}
+	if err := insertLeaf(ctx, tx, db, id, rev, parent, deleted, body, externalSize,
 		s.keepSuperseded.Load()); err != nil {
 		return fail(err)
 	}
@@ -192,6 +248,26 @@ func precomputeBulk(writes []BulkWrite) []bulkPrep {
 }
 
 func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]BulkResult, error) {
+	return s.bulkPutDocs(ctx, db, writes, -1)
+}
+
+// BulkPutDocsWithLimit applies a batch and evaluates partition growth in
+// request order against one transactionally locked metadata snapshot.
+func (s *Store) BulkPutDocsWithLimit(
+	ctx context.Context,
+	db *DB,
+	writes []BulkWrite,
+	maxPartitionSize int64,
+) ([]BulkResult, error) {
+	return s.bulkPutDocs(ctx, db, writes, maxPartitionSize)
+}
+
+func (s *Store) bulkPutDocs(
+	ctx context.Context,
+	db *DB,
+	writes []BulkWrite,
+	maxPartitionSize int64,
+) ([]BulkResult, error) {
 	results := make([]BulkResult, len(writes))
 	if len(writes) == 0 {
 		return results, nil
@@ -214,12 +290,14 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 		}
 	}
 	type winnerState struct {
-		rev     couch.Rev
-		deleted bool
+		rev          couch.Rev
+		deleted      bool
+		externalSize int64
 	}
 	winners := make(map[string]winnerState, len(ids))
 	rows, err := tx.Query(ctx, fmt.Sprintf(
-		"SELECT id, rev_num, rev_hash, deleted FROM %s.docs WHERE id = ANY($1) FOR UPDATE",
+		`SELECT id, rev_num, rev_hash, deleted, external_size
+		 FROM %s.docs WHERE id = ANY($1) ORDER BY id FOR UPDATE`,
 		db.Schema), ids)
 	if err != nil {
 		return nil, err
@@ -227,7 +305,7 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 	for rows.Next() {
 		var id string
 		var w winnerState
-		if err := rows.Scan(&id, &w.rev.Num, &w.rev.Hash, &w.deleted); err != nil {
+		if err := rows.Scan(&id, &w.rev.Num, &w.rev.Hash, &w.deleted, &w.externalSize); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -238,17 +316,41 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 		return nil, err
 	}
 
+	// Every batch takes its partition locks in one stable order after locking
+	// document rows in ID order and before any further writes. This prevents
+	// lock-order inversion across multi-partition batches and single-doc writes.
+	partitions := make([]string, 0)
+	seenPartitions := make(map[string]bool)
+	for _, w := range writes {
+		if partition, ok := partitionForWrite(db, w.ID); ok && !seenPartitions[partition] {
+			seenPartitions[partition] = true
+			partitions = append(partitions, partition)
+		}
+	}
+	if err := lockPartitionWrites(ctx, tx, db, partitions); err != nil {
+		return nil, err
+	}
+	var partitionSizes map[string]int64
+	if maxPartitionSize >= 0 {
+		partitionSizes, err = partitionSizesTx(ctx, tx, db, partitions)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Decide each write in order against the in-memory winner set.
 	type accepted struct {
-		idx    int
-		rev    couch.Rev
-		parent *couch.Rev
+		idx          int
+		rev          couch.Rev
+		parent       *couch.Rev
+		externalSize int64
 	}
 	var acc []accepted
 	maxRevNum := 0
 	for i, w := range writes {
 		var parent *couch.Rev
-		if winner, found := winners[w.ID]; found {
+		winner, found := winners[w.ID]
+		if found {
 			switch {
 			case w.Expected != nil && *w.Expected == winner.rev:
 			case w.Expected == nil && winner.deleted:
@@ -264,6 +366,7 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 			continue
 		}
 		var rev couch.Rev
+		var attachmentSize int64
 		// The precomputed hash assumed parent == Expected. Use it only
 		// when that held (it always does except tombstone recreates).
 		if prep[i].hashed &&
@@ -271,7 +374,7 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 			(parent == nil || *parent == *w.Expected) {
 			rev = prep[i].rev
 		} else {
-			revAtts, err := revAttsForWrite(ctx, tx, db, w.ID, parent, w.Atts)
+			revAtts, size, err := revAttsForWrite(ctx, tx, db, w.ID, parent, w.Atts)
 			if err != nil {
 				if _, ok := err.(*couch.Error); !ok {
 					return nil, err
@@ -279,6 +382,7 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 				results[i].Err = err
 				continue
 			}
+			attachmentSize = size
 			raw := w.RawBody
 			if raw == nil {
 				raw = prep[i].canonical
@@ -288,9 +392,24 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 				continue
 			}
 		}
+		externalSize := int64(0)
+		if !w.Deleted {
+			externalSize = int64(len(prep[i].canonical)) + attachmentSize
+		}
+		oldExternalSize := int64(0)
+		if found {
+			oldExternalSize = winner.externalSize
+		}
+		if partition, ok := partitionForWrite(db, w.ID); ok && maxPartitionSize >= 0 {
+			if externalSize > oldExternalSize && partitionSizes[partition] >= maxPartitionSize {
+				results[i].Err = partitionOverflow(w.ID)
+				continue
+			}
+			partitionSizes[partition] += externalSize - oldExternalSize
+		}
 		results[i].Rev = rev
-		acc = append(acc, accepted{idx: i, rev: rev, parent: parent})
-		winners[w.ID] = winnerState{rev: rev, deleted: w.Deleted}
+		acc = append(acc, accepted{idx: i, rev: rev, parent: parent, externalSize: externalSize})
+		winners[w.ID] = winnerState{rev: rev, deleted: w.Deleted, externalSize: externalSize}
 		if rev.Num > maxRevNum {
 			maxRevNum = rev.Num
 		}
@@ -309,6 +428,7 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 	parentHashes := make([]*string, len(acc))
 	deleteds := make([]bool, len(acc))
 	bodies := make([]string, len(acc))
+	externalSizes := make([]int64, len(acc))
 	for j, a := range acc {
 		w := writes[a.idx]
 		leafIDs[j] = w.ID
@@ -322,15 +442,16 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 		}
 		deleteds[j] = w.Deleted
 		bodies[j] = string(prep[a.idx].canonical)
+		externalSizes[j] = a.externalSize
 	}
 	if _, err := tx.Exec(ctx, fmt.Sprintf(
 		`INSERT INTO %s.revs (id, rev_num, rev_hash, parent_num, parent_hash,
-		   deleted, leaf, body)
-		 SELECT i, n, h, pn, ph, d, true, b::jsonb
+		   deleted, leaf, body, external_size)
+		 SELECT i, n, h, pn, ph, d, true, b::jsonb, x
 		 FROM unnest($1::text[], $2::int[], $3::text[], $4::int[], $5::text[],
-		             $6::bool[], $7::text[]) AS t(i, n, h, pn, ph, d, b)
+		             $6::bool[], $7::text[], $8::bigint[]) AS t(i, n, h, pn, ph, d, b, x)
 		 ON CONFLICT (id, rev_num, rev_hash) DO NOTHING`, db.Schema),
-		leafIDs, nums, hashes, parentNums, parentHashes, deleteds, bodies,
+		leafIDs, nums, hashes, parentNums, parentHashes, deleteds, bodies, externalSizes,
 	); err != nil {
 		return nil, err
 	}
@@ -395,18 +516,20 @@ func (s *Store) BulkPutDocs(ctx context.Context, db *DB, writes []BulkWrite) ([]
 		 ), ordered AS (
 		   SELECT t.id, t.ord FROM unnest($1::text[]) WITH ORDINALITY AS t(id, ord)
 		 ), w AS (
-		   SELECT DISTINCT ON (r.id) r.id, r.rev_num, r.rev_hash, r.deleted
+		   SELECT DISTINCT ON (r.id) r.id, r.rev_num, r.rev_hash, r.deleted,
+		          CASE WHEN r.deleted THEN 0 ELSE r.external_size END AS external_size
 		   FROM %[1]s.revs r JOIN ordered o ON o.id = r.id
 		   WHERE r.leaf
 		   ORDER BY r.id, r.deleted ASC, r.rev_num DESC, r.rev_hash DESC
 		 )
-		 INSERT INTO %[1]s.docs (id, rev_num, rev_hash, deleted, seq)
-		 SELECT w.id, w.rev_num, w.rev_hash, w.deleted, a.first_seq + o.ord - 1
+		 INSERT INTO %[1]s.docs (id, rev_num, rev_hash, deleted, seq, external_size)
+		 SELECT w.id, w.rev_num, w.rev_hash, w.deleted,
+		        a.first_seq + o.ord - 1, w.external_size
 		 FROM w JOIN ordered o ON o.id = w.id CROSS JOIN allocated a
 		 ORDER BY o.ord
 		 ON CONFLICT (id) DO UPDATE SET rev_num = EXCLUDED.rev_num,
 		   rev_hash = EXCLUDED.rev_hash, deleted = EXCLUDED.deleted,
-		   seq = EXCLUDED.seq`, db.Schema),
+		   seq = EXCLUDED.seq, external_size = EXCLUDED.external_size`, db.Schema),
 		written, int64(len(written)), db.Name,
 	)
 	if err != nil {
@@ -463,6 +586,13 @@ func (s *Store) ForceRev(
 	} else if known {
 		return tx.Rollback(ctx) // No-op. Rollback releases the lock.
 	}
+	if partition, ok := partitionForWrite(db, id); ok {
+		// Replication is exempt from the limit, but it shares the growth lock so
+		// a concurrent interactive writer observes the replicated size first.
+		if err := lockPartitionWrites(ctx, tx, db, []string{partition}); err != nil {
+			return err
+		}
+	}
 
 	// Find the deepest ancestor of the path already present. Everything
 	// between it and the new leaf is inserted as body-less path entries.
@@ -515,7 +645,15 @@ func (s *Store) ForceRev(
 	if len(path) > 1 {
 		parent = &path[1]
 	}
-	if err := insertLeafRev(ctx, tx, db, id, newest, parent, deleted, body); err != nil {
+	_, attachmentSize, err := revAttsForWrite(ctx, tx, db, id, parent, atts)
+	if err != nil {
+		return err
+	}
+	externalSize := int64(0)
+	if !deleted {
+		externalSize = int64(len(couch.CanonicalBody(body))) + attachmentSize
+	}
+	if err := insertLeafRev(ctx, tx, db, id, newest, parent, deleted, body, externalSize); err != nil {
 		return err
 	}
 	if err := writeAttachments(ctx, tx, db, id, newest, parent, atts); err != nil {
@@ -549,10 +687,10 @@ func lockWinner(ctx context.Context, tx pgx.Tx, db *DB, id string) (*DocRow, boo
 	row := &DocRow{ID: id}
 	var raw []byte
 	err := tx.QueryRow(ctx, fmt.Sprintf(
-		`SELECT d.rev_num, d.rev_hash, d.deleted, %s, d.seq
+		`SELECT d.rev_num, d.rev_hash, d.deleted, %s, d.seq, d.external_size
 		 FROM %s.docs d %s WHERE d.id = $1 FOR UPDATE OF d`,
 		winnerBody, db.Schema, winnerJoin(db.Schema)), id,
-	).Scan(&row.Rev.Num, &row.Rev.Hash, &row.Deleted, &raw, &row.Seq)
+	).Scan(&row.Rev.Num, &row.Rev.Hash, &row.Deleted, &raw, &row.Seq, &row.externalSize)
 	if err == pgx.ErrNoRows {
 		return nil, false, nil
 	}
@@ -592,7 +730,7 @@ func unleafSet(keepBody bool) string {
 // insertLeaf writes a new leaf that extends parent on the interactive path. The
 // parent stops being a leaf and, unless keepBody, drops its body.
 func insertLeaf(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.Rev,
-	parent *couch.Rev, deleted bool, body map[string]any, keepBody bool) error {
+	parent *couch.Rev, deleted bool, body map[string]any, externalSize int64, keepBody bool) error {
 	if parent != nil {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(
 			`UPDATE %s.revs SET %s
@@ -603,18 +741,18 @@ func insertLeaf(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.Rev
 			return err
 		}
 	}
-	return insertLeafRev(ctx, tx, db, id, rev, parent, deleted, body)
+	return insertLeafRev(ctx, tx, db, id, rev, parent, deleted, body, externalSize)
 }
 
 func insertLeafRev(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.Rev,
-	parent *couch.Rev, deleted bool, body map[string]any) error {
+	parent *couch.Rev, deleted bool, body map[string]any, externalSize int64) error {
 	tag, err := tx.Exec(ctx, fmt.Sprintf(
 		`INSERT INTO %s.revs (id, rev_num, rev_hash, parent_num, parent_hash,
-		   deleted, leaf, body)
-		 VALUES ($1, $2, $3, $4, $5, $6, true, $7)
+		   deleted, leaf, body, external_size)
+		 VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
 		 ON CONFLICT (id, rev_num, rev_hash) DO NOTHING`, db.Schema),
 		id, rev.Num, rev.Hash, parentNum(parent), parentHash(parent),
-		deleted, couch.CanonicalBody(body),
+		deleted, couch.CanonicalBody(body), externalSize,
 	)
 	if err != nil {
 		return err
@@ -632,17 +770,20 @@ func insertLeafRev(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.
 // committed update sequence, prunes deep history, and notifies the changes broker.
 func finishWrite(ctx context.Context, tx pgx.Tx, db *DB, id string) (int64, error) {
 	var winner struct {
-		num     int
-		hash    string
-		deleted bool
+		num          int
+		hash         string
+		deleted      bool
+		externalSize int64
 	}
 	// CouchDB selects winners deterministically. Live leaves beat deleted ones, then
 	// highest rev number, then lexicographically greater hash.
 	err := tx.QueryRow(ctx, fmt.Sprintf(
-		`SELECT rev_num, rev_hash, deleted FROM %s.revs
+		`SELECT rev_num, rev_hash, deleted,
+		        CASE WHEN deleted THEN 0 ELSE external_size END
+		 FROM %s.revs
 		 WHERE id = $1 AND leaf
 		 ORDER BY deleted ASC, rev_num DESC, rev_hash DESC LIMIT 1`, db.Schema), id,
-	).Scan(&winner.num, &winner.hash, &winner.deleted)
+	).Scan(&winner.num, &winner.hash, &winner.deleted, &winner.externalSize)
 	if err != nil {
 		return 0, fmt.Errorf("recomputing winner: %w", err)
 	}
@@ -653,12 +794,12 @@ func finishWrite(ctx context.Context, tx pgx.Tx, db *DB, id string) (int64, erro
 		   UPDATE couchgres.databases SET update_seq = update_seq + 1
 		   WHERE name = $1 RETURNING update_seq
 		 )
-		 INSERT INTO %s.docs (id, rev_num, rev_hash, deleted, seq)
-		 SELECT $2, $3, $4, $5, update_seq FROM allocated
+		 INSERT INTO %s.docs (id, rev_num, rev_hash, deleted, seq, external_size)
+		 SELECT $2, $3, $4, $5, update_seq, $6 FROM allocated
 		 ON CONFLICT (id) DO UPDATE SET rev_num = $3, rev_hash = $4,
-		   deleted = $5, seq = EXCLUDED.seq
+		   deleted = $5, seq = EXCLUDED.seq, external_size = $6
 		 RETURNING seq`, db.Schema),
-		db.Name, id, winner.num, winner.hash, winner.deleted,
+		db.Name, id, winner.num, winner.hash, winner.deleted, winner.externalSize,
 	).Scan(&seq)
 	if err == pgx.ErrNoRows {
 		return 0, fmt.Errorf("database metadata missing for %q", db.Name)

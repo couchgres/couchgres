@@ -839,13 +839,11 @@ func (s *Server) docPutImpl(w http.ResponseWriter, r *http.Request, dbName, doci
 	if err != nil {
 		return err
 	}
-	if err := s.checkPartitionLimit(r, db, docid, doc.Deleted, doc.Body); err != nil {
-		return err
-	}
 	if err := s.validateDocUpdate(r, db, docid, doc.Body, expected, doc.Deleted, doc.Attachments); err != nil {
 		return err
 	}
-	rev, _, err := s.store.PutDoc(r.Context(), db, docid, doc.Body, rawDoc, expected, doc.Deleted, atts)
+	rev, _, err := s.putInteractiveDoc(
+		r.Context(), db, docid, doc.Body, rawDoc, expected, doc.Deleted, atts)
 	if err != nil {
 		if batchAccepted(w, r, docid, err) {
 			return nil
@@ -884,7 +882,8 @@ func (s *Server) docDeleteImpl(w http.ResponseWriter, r *http.Request, dbName, d
 	if err := s.validateDocUpdate(r, db, docid, map[string]any{}, expected, true, nil); err != nil {
 		return err
 	}
-	rev, _, err := s.store.PutDoc(r.Context(), db, docid, map[string]any{}, nil, expected, true, nil)
+	rev, _, err := s.putInteractiveDoc(
+		r.Context(), db, docid, map[string]any{}, nil, expected, true, nil)
 	if err != nil {
 		return err
 	}
@@ -935,13 +934,11 @@ func (s *Server) docPost(w http.ResponseWriter, r *http.Request) error {
 	}
 	atts = orderAttachmentWrites(atts, rawDoc)
 	s.compressAttachmentWrites(atts)
-	if err := s.checkPartitionLimit(r, db, docid, doc.Deleted, doc.Body); err != nil {
-		return err
-	}
 	if err := s.validateDocUpdate(r, db, docid, doc.Body, doc.Rev, doc.Deleted, doc.Attachments); err != nil {
 		return err
 	}
-	rev, _, err := s.store.PutDoc(r.Context(), db, docid, doc.Body, rawDoc, doc.Rev, doc.Deleted, atts)
+	rev, _, err := s.putInteractiveDoc(
+		r.Context(), db, docid, doc.Body, rawDoc, doc.Rev, doc.Deleted, atts)
 	if err != nil {
 		if batchAccepted(w, r, docid, err) {
 			return nil
@@ -1030,7 +1027,8 @@ func (s *Server) copyOr405(w http.ResponseWriter, r *http.Request, dbName, docid
 	if err := s.validateDocUpdate(r, db, destID, source.Body, destRev, false, nil); err != nil {
 		return err
 	}
-	rev, _, err := s.store.PutDoc(r.Context(), db, destID, source.Body, nil, destRev, false, atts)
+	rev, _, err := s.putInteractiveDoc(
+		r.Context(), db, destID, source.Body, nil, destRev, false, atts)
 	if err != nil {
 		return err
 	}
@@ -1104,7 +1102,8 @@ func (s *Server) formDataUpdate(w http.ResponseWriter, r *http.Request, dbName, 
 	if err := s.validateDocUpdate(r, db, docid, current.Body, &rev, false, nil); err != nil {
 		return err
 	}
-	newRev, _, err := s.store.PutDoc(r.Context(), db, docid, current.Body, nil, &rev, false, atts)
+	newRev, _, err := s.putInteractiveDoc(
+		r.Context(), db, docid, current.Body, nil, &rev, false, atts)
 	if err != nil {
 		return err
 	}

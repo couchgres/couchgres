@@ -4,6 +4,7 @@ package httpapi
 // (_show/_update/_list/_rewrite), and cluster stubs.
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -109,6 +110,9 @@ func TestPartitionedDB(t *testing.T) {
 	if resp.body["props"].(map[string]any)["partitioned"] != true {
 		t.Fatalf("props: %+v", resp.body)
 	}
+	if resp.body["sizes"].(map[string]any)["external"].(float64) != 21 {
+		t.Fatalf("partition-backed database size: %+v", resp.body)
+	}
 
 	// Partition info + _all_docs.
 	resp = send(t, h, "GET", "/partdb/_partition/p1", nil, testAdminAuth, admin)
@@ -160,6 +164,70 @@ func TestPartitionedDB(t *testing.T) {
 	}
 	if resp.body["warning"] != nil {
 		t.Fatalf("indexed partition find warned: %+v", resp.body)
+	}
+}
+
+func TestPartitionBulkLimitUsesTransactionalTotals(t *testing.T) {
+	st := testHTTPStore(t)
+	h := testServer(t, st)
+	admin := adminAuth()
+	previous, existed, err := st.ConfigGet(t.Context(), "couchdb", "max_partition_size")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.config.set(t.Context(), st, "couchdb", "max_partition_size", "3"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_, _ = h.config.set(context.Background(), st,
+				"couchdb", "max_partition_size", previous)
+		} else {
+			_, _, _ = h.config.delete(context.Background(), st,
+				"couchdb", "max_partition_size")
+		}
+	})
+
+	send(t, h, "DELETE", "/partition_limit", nil, testAdminAuth, admin)
+	if resp := send(t, h, "PUT", "/partition_limit?partitioned=true", nil,
+		testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("create: %+v", resp)
+	}
+	defer send(t, h, "DELETE", "/partition_limit", nil, testAdminAuth, admin)
+
+	resp := send(t, h, "POST", "/partition_limit/_bulk_docs", decode(t,
+		`{"docs":[{"_id":"p:a"},{"_id":"p:b"},{"_id":"p:c"}]}`),
+		testAdminAuth, admin)
+	if resp.status != 201 || len(resp.array) != 3 {
+		t.Fatalf("bulk response: %+v", resp)
+	}
+	first := resp.array[0].(map[string]any)
+	if first["ok"] != true || resp.array[1].(map[string]any)["ok"] != true ||
+		resp.array[2].(map[string]any)["error"] != "partition_overflow" {
+		t.Fatalf("request-ordered outcomes: %+v", resp.array)
+	}
+	info := send(t, h, "GET", "/partition_limit/_partition/p", nil,
+		testAdminAuth, admin)
+	if info.status != 200 || info.body["doc_count"].(float64) != 2 ||
+		info.body["sizes"].(map[string]any)["external"].(float64) != 4 {
+		t.Fatalf("partition metadata: %+v", info)
+	}
+
+	// A delete is admitted while over the limit, and the next write may cross
+	// it again. A later growth then sees the committed metadata and is rejected.
+	rev := first["rev"].(string)
+	if deleted := send(t, h, "DELETE", "/partition_limit/p:a?rev="+rev, nil,
+		testAdminAuth, admin); deleted.status != 200 {
+		t.Fatalf("delete while over limit: %+v", deleted)
+	}
+	if crossed := send(t, h, "PUT", "/partition_limit/p:c", decode(t, `{}`),
+		testAdminAuth, admin); crossed.status != 201 {
+		t.Fatalf("crossing write: %+v", crossed)
+	}
+	if rejected := send(t, h, "PUT", "/partition_limit/p:d", decode(t, `{}`),
+		testAdminAuth, admin); rejected.status != 403 ||
+		rejected.body["error"] != "partition_overflow" {
+		t.Fatalf("post-crossing write: %+v", rejected)
 	}
 }
 

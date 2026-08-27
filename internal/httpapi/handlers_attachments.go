@@ -302,7 +302,8 @@ func (s *Server) attachmentPutImpl(w http.ResponseWriter, r *http.Request, dbNam
 	if err := s.validateDocUpdate(r, db, docid, body, expected, false, nil); err != nil {
 		return err
 	}
-	rev, _, err := s.store.PutDoc(r.Context(), db, docid, body, nil, expected, false, atts)
+	rev, _, err := s.putInteractiveDoc(
+		r.Context(), db, docid, body, nil, expected, false, atts)
 	if err != nil {
 		return err
 	}
@@ -355,7 +356,8 @@ func (s *Server) attachmentDeleteImpl(w http.ResponseWriter, r *http.Request, db
 	if err := s.validateDocUpdate(r, db, docid, current.Body, expected, false, nil); err != nil {
 		return err
 	}
-	rev, _, err := s.store.PutDoc(r.Context(), db, docid, current.Body, nil, expected, false, atts)
+	rev, _, err := s.putInteractiveDoc(
+		r.Context(), db, docid, current.Body, nil, expected, false, atts)
 	if err != nil {
 		return err
 	}

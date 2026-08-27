@@ -45,6 +45,30 @@ CREATE TRIGGER databases_sync_view_purge_seq
 AFTER UPDATE OF purge_seq ON couchgres.databases
 FOR EACH ROW EXECUTE FUNCTION couchgres.sync_view_purge_seq();
 
+-- Serialize partition growth decisions across Couchgres processes. Sorting
+-- inside PostgreSQL gives multi-partition batches one stable lock order.
+CREATE OR REPLACE FUNCTION couchgres.lock_partition_writes(
+    database_schema text,
+    partitions text[]
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $partition_locks$
+DECLARE
+    partition_name text;
+BEGIN
+    FOR partition_name IN
+        SELECT p
+          FROM (SELECT DISTINCT p FROM unnest(partitions) AS t(p)) AS unique_partitions
+         ORDER BY p COLLATE "C"
+    LOOP
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(database_schema || '/' || partition_name, 0)
+        );
+    END LOOP;
+END
+$partition_locks$;
+
 -- _all_dbs requires byte-order bounds and ordering regardless of the database's
 -- default collation. This expression index supports both scan directions.
 CREATE INDEX IF NOT EXISTS databases_name_c_idx
@@ -126,11 +150,12 @@ const dbDDLTemplate = `
 CREATE SCHEMA {s};
 
 CREATE TABLE {s}.docs (
-    id       text COLLATE "C" PRIMARY KEY,
-    rev_num  int NOT NULL,
-    rev_hash text NOT NULL,
-    deleted  boolean NOT NULL DEFAULT false,
-    seq      bigint NOT NULL
+    id            text COLLATE "C" PRIMARY KEY,
+    rev_num       int NOT NULL,
+    rev_hash      text NOT NULL,
+    deleted       boolean NOT NULL DEFAULT false,
+    seq           bigint NOT NULL,
+    external_size bigint NOT NULL DEFAULT 0 CHECK (external_size >= 0)
 );
 CREATE UNIQUE INDEX docs_seq_idx ON {s}.docs (seq);
 -- The VDU cache asks for the newest design-doc sequence on every write. Without
@@ -150,6 +175,7 @@ CREATE TABLE {s}.revs (
     deleted     boolean NOT NULL DEFAULT false,
     leaf        boolean NOT NULL,
     body        jsonb,
+    external_size bigint NOT NULL DEFAULT 0 CHECK (external_size >= 0),
     PRIMARY KEY (id, rev_num, rev_hash)
 );
 CREATE INDEX revs_leaves_idx ON {s}.revs (id) WHERE leaf;
@@ -189,8 +215,12 @@ CREATE TABLE {s}.view_state (
 );
 `
 
-func dbDDL(schema string) string {
-	return strings.ReplaceAll(dbDDLTemplate, "{s}", schema) + docCountTriggers(schema)
+func dbDDL(schema string, partitioned bool) string {
+	ddl := strings.ReplaceAll(dbDDLTemplate, "{s}", schema) + docCountTriggers(schema)
+	if partitioned {
+		ddl += partitionStatsDDL(schema)
+	}
+	return ddl
 }
 
 const docCountTriggersTemplate = `
@@ -213,4 +243,110 @@ FOR EACH STATEMENT EXECUTE FUNCTION couchgres.update_doc_counts();
 
 func docCountTriggers(schema string) string {
 	return strings.ReplaceAll(docCountTriggersTemplate, "{s}", schema)
+}
+
+// Partition statistics are striped by document hash so shrinking writes and
+// metadata reads do not funnel through one hot tuple. Exact growth admission is
+// coordinated separately by lock_partition_writes.
+const partitionStatsDDLTemplate = `
+CREATE TABLE {s}.partition_stats (
+    partition     text COLLATE "C" NOT NULL,
+    stripe        smallint NOT NULL CHECK (stripe >= 0 AND stripe < 16),
+    doc_count     bigint NOT NULL DEFAULT 0 CHECK (doc_count >= 0),
+    doc_del_count bigint NOT NULL DEFAULT 0 CHECK (doc_del_count >= 0),
+    external_size bigint NOT NULL DEFAULT 0 CHECK (external_size >= 0),
+    PRIMARY KEY (partition, stripe)
+);
+
+CREATE FUNCTION {s}.update_partition_stats()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $partition_stats$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO {s}.partition_stats AS stats
+            (partition, stripe, doc_count, doc_del_count, external_size)
+        SELECT delta.partition_key, delta.stripe_key, delta.doc_count,
+               delta.doc_del_count, delta.external_size
+          FROM (
+            SELECT split_part(id, ':', 1) AS partition_key,
+                   (hashtextextended(id, 0) & 15)::smallint AS stripe_key,
+                   count(*) FILTER (WHERE NOT deleted) AS doc_count,
+                   count(*) FILTER (WHERE deleted) AS doc_del_count,
+                   coalesce(sum(external_size), 0) AS external_size
+              FROM new_docs
+             WHERE strpos(id, ':') > 1
+             GROUP BY 1, 2
+          ) AS delta
+         ORDER BY delta.partition_key COLLATE "C", delta.stripe_key
+        ON CONFLICT (partition, stripe) DO UPDATE
+           SET doc_count = stats.doc_count + EXCLUDED.doc_count,
+               doc_del_count = stats.doc_del_count + EXCLUDED.doc_del_count,
+               external_size = stats.external_size + EXCLUDED.external_size;
+    ELSIF TG_OP = 'UPDATE' THEN
+        UPDATE {s}.partition_stats AS stats
+           SET doc_count = stats.doc_count + delta.doc_count,
+               doc_del_count = stats.doc_del_count + delta.doc_del_count,
+               external_size = stats.external_size + delta.external_size
+          FROM (
+            SELECT split_part(id, ':', 1) AS partition,
+                   (hashtextextended(id, 0) & 15)::smallint AS stripe,
+                   sum(live_delta) AS doc_count,
+                   sum(deleted_delta) AS doc_del_count,
+                   sum(size_delta) AS external_size
+              FROM (
+                SELECT id,
+                       CASE WHEN NOT deleted THEN 1 ELSE 0 END::bigint AS live_delta,
+                       CASE WHEN deleted THEN 1 ELSE 0 END::bigint AS deleted_delta,
+                       external_size::bigint AS size_delta
+                  FROM new_docs
+                UNION ALL
+                SELECT id,
+                       -CASE WHEN NOT deleted THEN 1 ELSE 0 END::bigint,
+                       -CASE WHEN deleted THEN 1 ELSE 0 END::bigint,
+                       -external_size::bigint
+                  FROM old_docs
+              ) AS changes
+             WHERE strpos(id, ':') > 1
+             GROUP BY 1, 2
+            HAVING sum(live_delta) <> 0 OR sum(deleted_delta) <> 0 OR sum(size_delta) <> 0
+          ) AS delta
+         WHERE stats.partition = delta.partition AND stats.stripe = delta.stripe;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE {s}.partition_stats AS stats
+           SET doc_count = stats.doc_count - delta.doc_count,
+               doc_del_count = stats.doc_del_count - delta.doc_del_count,
+               external_size = stats.external_size - delta.external_size
+          FROM (
+            SELECT split_part(id, ':', 1) AS partition,
+                   (hashtextextended(id, 0) & 15)::smallint AS stripe,
+                   count(*) FILTER (WHERE NOT deleted) AS doc_count,
+                   count(*) FILTER (WHERE deleted) AS doc_del_count,
+                   coalesce(sum(external_size), 0) AS external_size
+              FROM old_docs
+             WHERE strpos(id, ':') > 1
+             GROUP BY 1, 2
+          ) AS delta
+         WHERE stats.partition = delta.partition AND stats.stripe = delta.stripe;
+    END IF;
+    RETURN NULL;
+END
+$partition_stats$;
+
+CREATE TRIGGER docs_partition_stats_insert
+AFTER INSERT ON {s}.docs
+REFERENCING NEW TABLE AS new_docs
+FOR EACH STATEMENT EXECUTE FUNCTION {s}.update_partition_stats();
+CREATE TRIGGER docs_partition_stats_update
+AFTER UPDATE ON {s}.docs
+REFERENCING OLD TABLE AS old_docs NEW TABLE AS new_docs
+FOR EACH STATEMENT EXECUTE FUNCTION {s}.update_partition_stats();
+CREATE TRIGGER docs_partition_stats_delete
+AFTER DELETE ON {s}.docs
+REFERENCING OLD TABLE AS old_docs
+FOR EACH STATEMENT EXECUTE FUNCTION {s}.update_partition_stats();
+`
+
+func partitionStatsDDL(schema string) string {
+	return strings.ReplaceAll(partitionStatsDDLTemplate, "{s}", schema)
 }

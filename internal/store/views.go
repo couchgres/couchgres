@@ -716,55 +716,17 @@ func (s *Store) CountDocsThrough(ctx context.Context, db *DB, lo, hi string, del
 	return n, err
 }
 
-// SizeDocsAll is SizeDocsRange over the whole database. It returns the "external"
-// size, consistent with per-partition sums.
+// SizeDocsAll returns the stored external size. Partitioned databases sum the
+// bounded metadata rows so the result matches their partition totals.
 func (s *Store) SizeDocsAll(ctx context.Context, db *DB) (int64, error) {
-	var bodies, atts int64
-	err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		"SELECT coalesce(sum(length(%s::text)), 0) FROM %s.docs d %s WHERE NOT d.deleted",
-		winnerBody, db.Schema, winnerJoin(db.Schema))).Scan(&bodies)
-	if err != nil {
-		return 0, err
-	}
-	err = s.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT coalesce(sum(a.length), 0)
-		 FROM %[1]s.attachments a
-		 JOIN %[1]s.docs d ON a.doc_id = d.id AND a.rev_num = d.rev_num AND a.rev_hash = d.rev_hash
-		 WHERE NOT d.deleted`, db.Schema)).Scan(&atts)
-	return bodies + atts, err
-}
-
-// DocBodySize is the stored JSON text length of the live winner (0 when
-// missing or deleted). It feeds the partition-limit projection.
-func (s *Store) DocBodySize(ctx context.Context, db *DB, id string) (int64, error) {
 	var n int64
-	err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		"SELECT coalesce(length(%s::text), 0) FROM %s.docs d %s WHERE d.id = $1 AND NOT d.deleted",
-		winnerBody, db.Schema, winnerJoin(db.Schema)), id).Scan(&n)
-	if err == pgx.ErrNoRows {
-		return 0, nil
+	relation := db.Schema + ".docs"
+	if db.Partitioned {
+		relation = db.Schema + ".partition_stats"
 	}
+	err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		"SELECT coalesce(sum(external_size), 0) FROM %s", relation)).Scan(&n)
 	return n, err
-}
-
-// SizeDocsRange sums the JSON body text plus attachment bytes of live docs
-// with lo <= id < hi (the partition's "external" size).
-func (s *Store) SizeDocsRange(ctx context.Context, db *DB, lo, hi string) (int64, error) {
-	var bodies, atts int64
-	err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT coalesce(sum(length(%s::text)), 0) FROM %s.docs d %s
-		 WHERE NOT d.deleted AND d.id >= $1 AND d.id < $2`,
-		winnerBody, db.Schema, winnerJoin(db.Schema)), lo, hi).Scan(&bodies)
-	if err != nil {
-		return 0, err
-	}
-	err = s.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT coalesce(sum(a.length), 0)
-		 FROM %[1]s.attachments a
-		 JOIN %[1]s.docs d ON a.doc_id = d.id AND a.rev_num = d.rev_num AND a.rev_hash = d.rev_hash
-		 WHERE NOT d.deleted AND d.id >= $1 AND d.id < $2`,
-		db.Schema), lo, hi).Scan(&atts)
-	return bodies + atts, err
 }
 
 // ViewGroupState reads the group's last indexed seq (0 when never built).

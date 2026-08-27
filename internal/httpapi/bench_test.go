@@ -8,9 +8,12 @@ package httpapi
 // Needs the same local Postgres the integration tests use.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"testing"
+
+	"github.com/couchgres/couchgres/internal/store"
 )
 
 // benchDocs bulk-inserts n small docs shaped for the benchmark views.
@@ -32,6 +35,52 @@ func benchDocs(b *testing.B, h http.Handler, db string, n int) {
 			b.Fatalf("bulk seed: %+v", resp)
 		}
 	}
+}
+
+// BenchmarkPartitionPutAtScale measures the partition-limit path with enough
+// existing documents to expose accidental partition scans.
+func BenchmarkPartitionPutAtScale(b *testing.B) {
+	st := testHTTPStore(b)
+	h := testServer(b, st)
+	const dbName = "bench_partition_put"
+	const seedDocs = 20_000
+	_ = st.DeleteDatabase(b.Context(), dbName)
+	if err := st.CreateDatabase(b.Context(), dbName, true); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = st.DeleteDatabase(context.Background(), dbName) })
+	db, err := st.GetDB(b.Context(), dbName)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for start := 0; start < seedDocs; start += 1000 {
+		writes := make([]store.BulkWrite, 0, 1000)
+		for i := start; i < start+1000; i++ {
+			writes = append(writes, store.BulkWrite{
+				ID: fmt.Sprintf("p:seed%08d", i), Body: map[string]any{"value": i},
+			})
+		}
+		results, err := st.BulkPutDocs(b.Context(), db, writes)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for i, result := range results {
+			if result.Err != nil {
+				b.Fatalf("seed write %d: %v", start+i, result.Err)
+			}
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp := send(b, h, "PUT", fmt.Sprintf("/%s/p:write%08d", dbName, i),
+			map[string]any{"value": i}, testAdminAuth, adminAuth())
+		if resp.status != 201 {
+			b.Fatalf("partition write: %+v", resp)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(seedDocs, "seed_docs")
 }
 
 // BenchmarkViewBuild measures JS map indexing throughput. Each iteration

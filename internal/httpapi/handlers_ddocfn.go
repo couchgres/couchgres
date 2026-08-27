@@ -375,7 +375,8 @@ func (s *Server) updateHandler(w http.ResponseWriter, r *http.Request) error {
 		// the member order CouchDB's rev hash covers.
 		atts = orderAttachmentWrites(atts, pair[0])
 		s.compressAttachmentWrites(atts)
-		rev, _, err := s.store.PutDoc(r.Context(), db, writeID, newDoc.Body, pair[0], expected, newDoc.Deleted, atts)
+		rev, _, err := s.putInteractiveDoc(
+			r.Context(), db, writeID, newDoc.Body, pair[0], expected, newDoc.Deleted, atts)
 		if err != nil {
 			return err
 		}

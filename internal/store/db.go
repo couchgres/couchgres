@@ -77,7 +77,7 @@ func (s *Store) CreateDatabase(ctx context.Context, name string, partitioned boo
 	if tag.RowsAffected() == 0 {
 		return couch.DBExists()
 	}
-	if _, err := tx.Exec(ctx, dbDDL(schema)); err != nil {
+	if _, err := tx.Exec(ctx, dbDDL(schema, partitioned)); err != nil {
 		return fmt.Errorf("creating schema for %s: %w", name, err)
 	}
 	// CouchDB 3.x sets default_security = admin_only. Fresh databases are
@@ -361,18 +361,18 @@ func databaseInfoDetailsQuery(infos []DatabaseInfo) (string, []any) {
 			query.WriteString(" UNION ALL ")
 		}
 		args[i] = item.DB.Name
+		externalSize := fmt.Sprintf(
+			"(SELECT coalesce(sum(external_size), 0) FROM %s.docs)", item.DB.Schema)
+		if item.DB.Partitioned {
+			externalSize = fmt.Sprintf(
+				"(SELECT coalesce(sum(external_size), 0) FROM %s.partition_stats)",
+				item.DB.Schema)
+		}
 		fmt.Fprintf(&query, `SELECT $%d::text,
 		   pg_total_relation_size('%[2]s.docs')
 		     + pg_total_relation_size('%[2]s.revs')
-		     + pg_total_relation_size('%[2]s.attachments'),
-		   (SELECT coalesce(sum(length(%[3]s::text)), 0)
-		      FROM %[2]s.docs d %[4]s WHERE NOT d.deleted)
-		     + (SELECT coalesce(sum(a.length), 0)
-		          FROM %[2]s.attachments a
-		          JOIN %[2]s.docs d ON a.doc_id = d.id
-		            AND a.rev_num = d.rev_num AND a.rev_hash = d.rev_hash
-		         WHERE NOT d.deleted)`,
-			i+1, item.DB.Schema, winnerBody, winnerJoin(item.DB.Schema))
+		     + pg_total_relation_size('%[2]s.attachments'), %[3]s`,
+			i+1, item.DB.Schema, externalSize)
 	}
 	return query.String(), args
 }

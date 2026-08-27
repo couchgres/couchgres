@@ -26,7 +26,7 @@ func testStoreURL() string {
 	return url
 }
 
-func testStore(t *testing.T) *Store {
+func testStore(t testing.TB) *Store {
 	t.Helper()
 	url := testStoreURL()
 	s, err := New(t.Context(), url, 4)

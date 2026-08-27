@@ -3,6 +3,7 @@ package httpapi
 // Purge and partitioned-database endpoints.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -175,33 +176,21 @@ func (s *Server) validateDocIDForDB(db *store.DB, docid string) error {
 	return nil
 }
 
-// checkPartitionLimit rejects interactive (new_edits) writes that would
-// grow a partition past couchdb/max_partition_size. Deletes, shrinking
-// updates, and replicated writes still land, so a full partition can be
-// drained.
-func (s *Server) checkPartitionLimit(r *http.Request, db *store.DB, docid string, deleting bool, body map[string]any) error {
-	if !db.Partitioned || deleting ||
-		strings.HasPrefix(docid, "_design/") || strings.HasPrefix(docid, "_local/") {
-		return nil
-	}
+// putInteractiveDoc keeps the partition-limit policy at the HTTP boundary
+// while the store performs the decision atomically with the document write.
+func (s *Server) putInteractiveDoc(
+	ctx context.Context,
+	db *store.DB,
+	docid string,
+	body map[string]any,
+	rawBody []byte,
+	expected *couch.Rev,
+	deleted bool,
+	atts []store.AttachmentWrite,
+) (couch.Rev, int64, error) {
 	max := int64(s.config.getInt("couchdb", "max_partition_size", 10737418240))
-	lo, hi := store.PartitionRange(store.PartitionOf(docid))
-	size, err := s.store.SizeDocsRange(r.Context(), db, lo, hi)
-	if err != nil {
-		return err
-	}
-	newRaw, _ := json.Marshal(body)
-	oldSize, err := s.store.DocBodySize(r.Context(), db, docid)
-	if err != nil {
-		return err
-	}
-	// CouchDB's rule: once the partition sits at the limit, only writes
-	// that shrink it may land (the write crossing the line is allowed).
-	if int64(len(newRaw)) > oldSize && size >= max {
-		return couch.NewError(403, "partition_overflow",
-			"Partition limit exceeded due to update on '"+docid+"'")
-	}
-	return nil
+	return s.store.PutDocWithLimit(
+		ctx, db, docid, body, rawBody, expected, deleted, atts, max)
 }
 
 // partitionInfo is GET /{db}/_partition/{partition}.
@@ -210,25 +199,18 @@ func (s *Server) partitionInfo(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	lo, hi := store.PartitionRange(partition)
-	docCount, err := s.store.CountDocsRange(r.Context(), db, lo, hi, false)
-	if err != nil {
-		return err
-	}
-	delCount, err := s.store.CountDocsRange(r.Context(), db, lo, hi, true)
-	if err != nil {
-		return err
-	}
-	size, err := s.store.SizeDocsRange(r.Context(), db, lo, hi)
+	stats, err := s.store.GetPartitionStats(r.Context(), db, partition)
 	if err != nil {
 		return err
 	}
 	writeJSON(w, 200, map[string]any{
 		"db_name":       db.Name,
 		"partition":     partition,
-		"doc_count":     docCount,
-		"doc_del_count": delCount,
-		"sizes":         map[string]int64{"active": size, "external": size},
+		"doc_count":     stats.DocCount,
+		"doc_del_count": stats.DocDelCount,
+		"sizes": map[string]int64{
+			"active": stats.ExternalSize, "external": stats.ExternalSize,
+		},
 	})
 	return nil
 }
@@ -292,10 +274,11 @@ func (s *Server) partitionAllDocsImpl(w http.ResponseWriter, r *http.Request, bo
 	if err != nil {
 		return err
 	}
-	total, err := s.store.CountDocsRange(r.Context(), db, lo, hi, false)
+	stats, err := s.store.GetPartitionStats(r.Context(), db, partition)
 	if err != nil {
 		return err
 	}
+	total := stats.DocCount
 	page.TotalRows = total
 	if !req.sendKeys {
 		var preceding int64

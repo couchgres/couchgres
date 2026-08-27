@@ -157,10 +157,6 @@ func (s *Server) bulkDocs(w http.ResponseWriter, r *http.Request) error {
 		s.compressAttachmentWrites(atts)
 
 		if newEdits {
-			if err := s.checkPartitionLimit(r, db, docid, doc.Deleted, doc.Body); err != nil {
-				report(docid, err)
-				continue
-			}
 			if err := s.validateDocUpdate(r, db, docid, doc.Body, doc.Rev, doc.Deleted, doc.Attachments); err != nil {
 				report(docid, err)
 				continue
@@ -190,7 +186,10 @@ func (s *Server) bulkDocs(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if len(bulkWrites) > 0 {
-		outcomes, err := s.store.BulkPutDocs(r.Context(), db, bulkWrites)
+		maxPartitionSize := int64(s.config.getInt(
+			"couchdb", "max_partition_size", 10737418240))
+		outcomes, err := s.store.BulkPutDocsWithLimit(
+			r.Context(), db, bulkWrites, maxPartitionSize)
 		if err != nil {
 			return err
 		}

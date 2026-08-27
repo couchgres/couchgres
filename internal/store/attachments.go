@@ -135,9 +135,9 @@ func writeAttachments(
 }
 
 // revAttsForWrite assembles the attachment triples CouchDB folds into a
-// revision hash, in write order. Stubs
-// contribute the parent revision's stored content type and digest, like
-// couch_doc:merge_stubs resolving from disk.
+// revision hash, in write order. It also returns their decoded external byte
+// total for partition accounting. Stubs contribute the parent revision's
+// stored metadata, like couch_doc:merge_stubs resolving from disk.
 func revAttsForWrite(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -145,15 +145,16 @@ func revAttsForWrite(
 	id string,
 	parent *couch.Rev,
 	atts []AttachmentWrite,
-) ([]couch.RevAtt, error) {
+) ([]couch.RevAtt, int64, error) {
 	if len(atts) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	out := make([]couch.RevAtt, 0, len(atts))
+	var externalSize int64
 	for _, att := range atts {
 		if att.Data == nil {
 			if parent == nil {
-				return nil, missingStub(att.Name)
+				return nil, 0, missingStub(att.Name)
 			}
 			revposCond := ""
 			args := []any{id, parent.Num, parent.Hash, att.Name}
@@ -162,26 +163,33 @@ func revAttsForWrite(
 				revposCond = " AND revpos = $5"
 			}
 			var ctype, digest string
+			var length int64
 			err := tx.QueryRow(ctx, fmt.Sprintf(
-				`SELECT content_type, digest FROM %s.attachments
+				`SELECT content_type, digest, length FROM %s.attachments
 				 WHERE doc_id = $1 AND rev_num = $2 AND rev_hash = $3 AND name = $4%s`,
-				db.Schema, revposCond), args...).Scan(&ctype, &digest)
+				db.Schema, revposCond), args...).Scan(&ctype, &digest, &length)
 			if err == pgx.ErrNoRows {
-				return nil, missingStub(att.Name)
+				return nil, 0, missingStub(att.Name)
 			}
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
+			externalSize += length
 			out = append(out, couch.RevAtt{Name: att.Name, ContentType: ctype, Digest: digest})
 			continue
 		}
+		length := int64(len(att.Data))
+		if att.Encoding != "" {
+			length = att.DecodedLength
+		}
+		externalSize += length
 		digest := att.Digest
 		if digest == "" {
 			digest = AttachmentDigest(att.Data)
 		}
 		out = append(out, couch.RevAtt{Name: att.Name, ContentType: att.ContentType, Digest: digest})
 	}
-	return out, nil
+	return out, externalSize, nil
 }
 
 func missingStub(name string) error {

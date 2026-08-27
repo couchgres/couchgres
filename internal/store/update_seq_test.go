@@ -60,7 +60,7 @@ func prepareDocumentUpdate(
 	if err != nil {
 		return couch.Rev{}, err
 	}
-	if err := insertLeaf(ctx, tx, db, id, rev, &parent, false, body,
+	if err := insertLeaf(ctx, tx, db, id, rev, &parent, false, body, int64(len(raw)),
 		s.keepSuperseded.Load()); err != nil {
 		return couch.Rev{}, err
 	}
