@@ -7,7 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -243,8 +245,11 @@ func (s *Server) proxyUser(r *http.Request) (*couch.UserCtx, error) {
 	if name == "" {
 		return nil, nil
 	}
-	if s.config.getBool("couch_httpd_auth", "proxy_use_secret", false) {
+	if s.config.proxyUseSecret() {
 		secret := s.config.getOr("couch_httpd_auth", "secret", "")
+		if secret == "" {
+			return nil, couch.Unauthorized("Proxy authentication is not configured securely.")
+		}
 		token := r.Header.Get(
 			s.config.getOr("couch_httpd_auth", "x_auth_token", "X-Auth-CouchDB-Token"))
 		mac := hmac.New(sha1.New, []byte(secret))
@@ -253,6 +258,8 @@ func (s *Server) proxyUser(r *http.Request) (*couch.UserCtx, error) {
 		if !hmac.Equal([]byte(expected), []byte(token)) {
 			return nil, couch.Unauthorized("Proxy token is incorrect.")
 		}
+	} else if !s.trustUnsignedProxyHeaders(r) {
+		return nil, couch.Unauthorized("Unsigned proxy authentication is not allowed from this address.")
 	}
 	var roles []string
 	rolesHeader := r.Header.Get(
@@ -263,6 +270,33 @@ func (s *Server) proxyUser(r *http.Request) (*couch.UserCtx, error) {
 		}
 	}
 	return &couch.UserCtx{Name: name, Roles: roles, Authenticated: "proxy"}, nil
+}
+
+// trustUnsignedProxyHeaders deliberately uses the direct socket peer only.
+// Forwarded headers are attacker-controlled until a proxy has been trusted.
+func (s *Server) trustUnsignedProxyHeaders(r *http.Request) bool {
+	if !s.config.proxyAllowsInsecureHeaders() {
+		return false
+	}
+	trusted, err := s.config.proxyTrustedNetworks()
+	if err != nil || len(trusted) == 0 {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap().WithZone("")
+	for _, prefix := range trusted {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // lookupUser finds credentials for a name: the admins config section first

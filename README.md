@@ -80,10 +80,20 @@ CouchDB-style settings are stored in PostgreSQL and exposed through `/_node/_loc
 | `couchdb/default_security`                                                | `admin_only`, the CouchDB 3.x default, or `everyone` for public databases like pre 3.x CouchDB.                                                                                                                         |
 | `couchgres/keep_superseded_bodies`                                        | Defaults to `false`, which removes a revision body when a newer revision replaces it. Set it to `true` to keep superseded bodies readable through `?rev=` until `POST /{db}/_compact`. Changes take effect immediately. |
 | `couch_httpd_auth/{iterations,min_iterations,max_iterations}`             | PBKDF2 work-factor policy. The default is 600,000 iterations; runtime bounds may narrow but cannot exceed the process safety ceiling of 1,200,000.                                                                      |
+| `chttpd_auth/proxy_authentication`                                        | Enables `X-Auth-CouchDB-*` proxy authentication. Signed headers are required by default.                                                                                                                                |
+| `couch_httpd_auth/{proxy_use_secret,secret}`                              | `proxy_use_secret` defaults to `true`; `secret` must be non-empty and signs the username token using CouchDB-compatible HMAC-SHA1.                                                                                      |
+| `couch_httpd_auth/{proxy_allow_insecure_headers,proxy_trusted_cidrs}`     | Unsigned mode requires `proxy_use_secret=false`, explicit insecure-header acknowledgement, and a comma-separated trusted direct-proxy CIDR list.                                                                        |
 | `chttpd_auth_lockout/{mode,threshold,max_objects,max_lifetime}`           | Repeated username/client-IP failure policy. Defaults to `enforce`, 5 failures, 10,000 tracked pairs, and a five-minute lifetime.                                                                                        |
 | `chttpd/max_http_request_size`                                            | Global request-body ceiling. Defaults to 64 MiB and cannot exceed the 256 MiB process safety ceiling.                                                                                                                   |
 | `chttpd/secure_rewrites`                                                  | Defaults to `true`, restricting array and function rewrites to the source database and original HTTP method. With `false`, cross-scope or method-changing rewrites still require a server administrator.                |
 | `couchgres_httpd/max_{small,query,document,bulk,attachment}_request_size` | Route-specific request-body ceilings. Defaults to 64 KiB, 1 MiB, 16 MiB, 64 MiB, and 64 MiB respectively; the global ceiling always wins.                                                                               |
+
+When proxy authentication is enabled, the edge proxy must remove all incoming
+configured username, roles, and token headers before setting its own values.
+Unsigned mode is intended only for tightly controlled deployments: Couchgres
+matches `proxy_trusted_cidrs` against the direct socket peer (`RemoteAddr`) and
+never trusts `X-Forwarded-For` to establish proxy identity. Prefer signed mode
+even on private networks.
 
 ### JavaScript resource limits
 

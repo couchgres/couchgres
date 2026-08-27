@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -57,6 +58,9 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) error {
 		value != "true" && value != "false" {
 		return couch.BadRequest("secure_rewrites must be true or false")
 	}
+	if err := validateProxyAuthConfigChange(section, key, value); err != nil {
+		return couch.BadRequest(err.Error())
+	}
 	if err := validateRequestBodySizeChange(section, key, value); err != nil {
 		return couch.BadRequest(err.Error())
 	}
@@ -92,6 +96,21 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) error {
 	}
 	s.applyStoreConfig()
 	writeJSON(w, 200, previous)
+	return nil
+}
+
+func validateProxyAuthConfigChange(section, key, value string) error {
+	if (section == "chttpd_auth" && key == "proxy_authentication") ||
+		(section == "couch_httpd_auth" &&
+			(key == "proxy_use_secret" || key == "proxy_allow_insecure_headers")) {
+		if value != "true" && value != "false" {
+			return fmt.Errorf("%s must be true or false", key)
+		}
+	}
+	if section == "couch_httpd_auth" && key == "proxy_trusted_cidrs" {
+		_, err := parseProxyTrustedCIDRs(value)
+		return err
+	}
 	return nil
 }
 

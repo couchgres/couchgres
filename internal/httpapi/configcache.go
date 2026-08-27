@@ -3,7 +3,9 @@ package httpapi
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -252,4 +254,50 @@ func (c *configCache) requireValidUser() bool {
 
 func (c *configCache) proxyAuthEnabled() bool {
 	return c.getBool("chttpd_auth", "proxy_authentication", false)
+}
+
+// proxyUseSecret fails closed: only an explicit "false" requests unsigned
+// proxy headers, which are separately gated by acknowledgement and source CIDR.
+func (c *configCache) proxyUseSecret() bool {
+	return c.getOr("couch_httpd_auth", "proxy_use_secret", "true") != "false"
+}
+
+func (c *configCache) proxyAllowsInsecureHeaders() bool {
+	return c.getOr("couch_httpd_auth", "proxy_allow_insecure_headers", "false") == "true"
+}
+
+func (c *configCache) proxyTrustedNetworks() ([]netip.Prefix, error) {
+	return parseProxyTrustedCIDRs(
+		c.getOr("couch_httpd_auth", "proxy_trusted_cidrs", ""))
+}
+
+const (
+	maxProxyTrustedCIDRBytes = 16 << 10
+	maxProxyTrustedCIDRs     = 256
+)
+
+func parseProxyTrustedCIDRs(value string) ([]netip.Prefix, error) {
+	if len(value) > maxProxyTrustedCIDRBytes {
+		return nil, fmt.Errorf("proxy_trusted_cidrs is too large")
+	}
+	fields := strings.Fields(strings.ReplaceAll(value, ",", " "))
+	if len(fields) > maxProxyTrustedCIDRs {
+		return nil, fmt.Errorf("proxy_trusted_cidrs has more than %d entries", maxProxyTrustedCIDRs)
+	}
+	prefixes := make([]netip.Prefix, 0, len(fields))
+	for _, field := range fields {
+		prefix, err := netip.ParsePrefix(field)
+		if err != nil {
+			return nil, fmt.Errorf("proxy_trusted_cidrs contains invalid CIDR %q", field)
+		}
+		if prefix.Addr().Is4In6() {
+			bits := prefix.Bits() - 96
+			if bits < 0 {
+				return nil, fmt.Errorf("proxy_trusted_cidrs contains invalid mapped CIDR %q", field)
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), bits)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
