@@ -22,6 +22,9 @@ type jsMapper struct{ pool *jsengine.Pool }
 // jsPoolError shapes pool failures for HTTP. A timed-out script answers
 // like CouchDB's killed couchjs.
 func jsPoolError(err error) error {
+	if errors.Is(err, jsengine.ErrClosed) {
+		return couch.NewError(503, "service_unavailable", "JavaScript process pool is shutting down.")
+	}
 	if errors.Is(err, jsengine.ErrTimeout) {
 		return couch.NewError(500, "os_process_error", "OS process timed out.")
 	}
@@ -32,7 +35,8 @@ func jsPoolError(err error) error {
 }
 
 func isJSProcessError(err error) bool {
-	return errors.Is(err, jsengine.ErrTimeout) ||
+	return errors.Is(err, jsengine.ErrClosed) ||
+		errors.Is(err, jsengine.ErrTimeout) ||
 		errors.Is(err, jsengine.ErrMemoryLimit) ||
 		errors.Is(err, jsengine.ErrOutputLimit)
 }

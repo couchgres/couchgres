@@ -38,6 +38,10 @@ type Server struct {
 	startedAt          time.Time
 	streamWriteTimeout time.Duration
 	replicatorOnce     sync.Once
+	closeOnce          sync.Once
+	serveMu            sync.Mutex
+	serveWG            sync.WaitGroup
+	closing            bool
 
 	// UUID generation state (config uuids/algorithm).
 	uuidMu         sync.Mutex
@@ -48,7 +52,30 @@ type Server struct {
 
 // ServeHTTP makes *Server the http.Handler main and tests mount.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.serveMu.Lock()
+	if s.closing {
+		s.serveMu.Unlock()
+		writeError(w, couch.NewError(http.StatusServiceUnavailable,
+			"service_unavailable", "server is shutting down"))
+		return
+	}
+	s.serveWG.Add(1)
+	s.serveMu.Unlock()
+	defer s.serveWG.Done()
 	s.handler.ServeHTTP(w, r)
+}
+
+// Close stops accepting direct handler calls, waits for active HTTP handlers,
+// and then releases the JavaScript workers. The network server must stop
+// accepting requests before calling Close. Close is idempotent.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		s.serveMu.Lock()
+		s.closing = true
+		s.serveMu.Unlock()
+		s.serveWG.Wait()
+		s.js.Close()
+	})
 }
 
 // SetSelfURL wires the server's own base URL so replication endpoints given
@@ -113,10 +140,6 @@ func New(ctx context.Context, st *store.Store, serverUUID string) (*Server, erro
 	s.reducer = jsReducer{pool: s.js}
 	s.applyStoreConfig()
 	go s.watchInvalidations(ctx)
-	go func() {
-		<-ctx.Done()
-		s.js.Close()
-	}()
 	s.scheduler = replicate.NewScheduler(st, s.broker)
 
 	mux := http.NewServeMux()

@@ -59,6 +59,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initializing API: %w", err)
 	}
+	// The API owns the JavaScript pool. Stop background work, drain every HTTP
+	// handler, and release the pool before the deferred store close.
+	defer func() {
+		stop()
+		api.Close()
+	}()
 	addr := net.JoinHostPort(cfg.Bind, strconv.Itoa(cfg.Port))
 	// Local replication endpoints loop back over HTTP; wildcard binds
 	// loop back via localhost.
@@ -85,14 +91,27 @@ func run() error {
 
 	select {
 	case err := <-errCh:
+		// Serve closes its listeners before returning, but accepted connections
+		// can still have active handlers. Cancel those before API cleanup waits
+		// for them and releases the JavaScript pool.
+		if closeErr := server.Close(); closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
 		return err
 	case <-ctx.Done():
 		slog.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil &&
-			!errors.Is(err, context.DeadlineExceeded) {
-			return err
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				slog.Warn("graceful shutdown timed out; closing active connections")
+			}
+			if closeErr := server.Close(); closeErr != nil {
+				return errors.Join(err, closeErr)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 		}
 		return nil
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -448,6 +449,115 @@ func TestQuickJSMemoryLimit(t *testing.T) {
 		[]json.RawMessage{raw(`{}`)})
 	if err != nil || len(out[0][0]) != 1 {
 		t.Fatalf("pool did not recover after memory limit: %v %+v", err, out)
+	}
+}
+
+func TestCloseRejectsQueuedWorkAndWaitsForActiveJob(t *testing.T) {
+	p := NewPool(1, 2*time.Second)
+	activeStarted := make(chan struct{})
+	releaseActive := make(chan struct{})
+	activeErr := make(chan error, 1)
+	go func() {
+		activeErr <- p.exec(context.Background(), func(*worker) error {
+			close(activeStarted)
+			<-releaseActive
+			return nil
+		})
+	}()
+	<-activeStarted
+
+	queuedErr := make(chan error, 1)
+	go func() {
+		queuedErr <- p.exec(context.Background(), func(*worker) error {
+			return errors.New("queued job ran during shutdown")
+		})
+	}()
+	deadline := time.Now().Add(time.Second)
+	for p.Stats().Queued != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("second job did not queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closeDone)
+	}()
+	select {
+	case err := <-queuedErr:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("queued call: want ErrClosed, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued call was not rejected during shutdown")
+	}
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned while a job was active")
+	default:
+	}
+
+	close(releaseActive)
+	if err := <-activeErr; err != nil {
+		t.Fatalf("active job: %v", err)
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after active job completed")
+	}
+	if err := p.exec(context.Background(), func(*worker) error { return nil }); !errors.Is(err, ErrClosed) {
+		t.Fatalf("post-close call: want ErrClosed, got %v", err)
+	}
+
+	// A repeated close must return immediately.
+	done := make(chan struct{})
+	go func() {
+		p.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("repeated Close blocked")
+	}
+}
+
+func TestConcurrentCloseAndSubmit(t *testing.T) {
+	for iteration := 0; iteration < 20; iteration++ {
+		p := NewPool(2, 2*time.Second)
+		start := make(chan struct{})
+		errs := make(chan error, 64)
+		var submitters sync.WaitGroup
+		for i := 0; i < cap(errs); i++ {
+			submitters.Add(1)
+			go func() {
+				defer submitters.Done()
+				<-start
+				errs <- p.exec(context.Background(), func(*worker) error { return nil })
+			}()
+		}
+
+		var closers sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			closers.Add(1)
+			go func() {
+				defer closers.Done()
+				<-start
+				p.Close()
+			}()
+		}
+		close(start)
+		submitters.Wait()
+		closers.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil && !errors.Is(err, ErrClosed) {
+				t.Fatalf("iteration %d submission: %v", iteration, err)
+			}
+		}
 	}
 }
 

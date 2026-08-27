@@ -54,6 +54,8 @@ const (
 var (
 	// ErrTimeout reports a script exceeding the wall-clock limit.
 	ErrTimeout = errors.New("JavaScript execution timed out")
+	// ErrClosed reports work submitted after pool shutdown has begun.
+	ErrClosed = errors.New("JavaScript pool is closed")
 	// ErrMemoryLimit reports a script exhausting its QuickJS heap budget.
 	ErrMemoryLimit = errors.New("JavaScript memory limit exceeded")
 	// ErrOutputLimit reports a script producing too many bytes or emitted rows.
@@ -117,12 +119,18 @@ type poolStats struct {
 }
 
 type Pool struct {
-	jobs    chan func(*worker)
-	wg      sync.WaitGroup
-	timeout time.Duration
-	workers int
-	limits  Limits
-	stats   poolStats
+	jobs       chan func(*worker)
+	wg         sync.WaitGroup
+	timeout    time.Duration
+	workers    int
+	limits     Limits
+	stats      poolStats
+	stateMu    sync.Mutex
+	closing    bool
+	submitters sync.WaitGroup
+	closeOnce  sync.Once
+	stopping   chan struct{}
+	stopped    chan struct{}
 }
 
 // NewPool starts size workers, capped at four. Zero uses the smaller of
@@ -147,10 +155,12 @@ func NewPoolWithLimits(size int, timeout time.Duration, limits Limits) *Pool {
 	}
 	limits = limits.withDefaults()
 	p := &Pool{
-		jobs:    make(chan func(*worker)),
-		timeout: timeout,
-		workers: size,
-		limits:  limits,
+		jobs:     make(chan func(*worker)),
+		timeout:  timeout,
+		workers:  size,
+		limits:   limits,
+		stopping: make(chan struct{}),
+		stopped:  make(chan struct{}),
 	}
 	for i := 0; i < size; i++ {
 		p.wg.Add(1)
@@ -189,16 +199,44 @@ func (p *Pool) Stats() Stats {
 	}
 }
 
-// Close stops the workers and frees the VMs.
+// Close stops accepting work, waits for admitted submissions and active jobs,
+// and then frees the VMs. It is safe to call concurrently and repeatedly.
 func (p *Pool) Close() {
-	close(p.jobs)
-	p.wg.Wait()
+	p.closeOnce.Do(func() {
+		p.stateMu.Lock()
+		p.closing = true
+		close(p.stopping)
+		p.stateMu.Unlock()
+
+		// No submitter can be added after closing becomes true. Waiting here
+		// therefore guarantees that closing jobs cannot race a channel send.
+		p.submitters.Wait()
+		close(p.jobs)
+		p.wg.Wait()
+		close(p.stopped)
+	})
+	<-p.stopped
+}
+
+func (p *Pool) beginSubmit() bool {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if p.closing {
+		return false
+	}
+	p.submitters.Add(1)
+	return true
 }
 
 // exec runs fn on a worker and respects ctx while waiting for a free one and
 // while the job runs. Cancellation interrupts the active QuickJS evaluation
 // so the worker is freed promptly instead of running until the pool timeout.
 func (p *Pool) exec(ctx context.Context, fn func(*worker) error) error {
+	if !p.beginSubmit() {
+		return ErrClosed
+	}
+	defer p.submitters.Done()
+
 	done := make(chan error, 1)
 	job := func(w *worker) {
 		p.stats.queued.Add(-1)
@@ -214,6 +252,9 @@ func (p *Pool) exec(ctx context.Context, fn func(*worker) error) error {
 	p.stats.queued.Add(1)
 	select {
 	case p.jobs <- job:
+	case <-p.stopping:
+		p.stats.queued.Add(-1)
+		return ErrClosed
 	case <-ctx.Done():
 		p.stats.queued.Add(-1)
 		return ctx.Err()
