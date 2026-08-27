@@ -77,7 +77,8 @@ func (s *Server) buildJSChangesFilter(r *http.Request, db *store.DB, filter stri
 	ddocRaw := ddocJSON(ddoc)
 	return func(ctx context.Context, changes []store.Change) ([]bool, error) {
 		docs := changeDocsJSON(changes)
-		return s.js.FilterDocs(ctx, sig, src, docs, reqRaw, ddocRaw)
+		out, err := s.js.FilterDocs(ctx, sig, src, docs, reqRaw, ddocRaw)
+		return out, jsPoolError(err)
 	}, nil
 }
 
@@ -101,7 +102,7 @@ func (s *Server) buildViewChangesFilter(r *http.Request, db *store.DB, view stri
 		docs := changeDocsJSON(changes)
 		emits, err := s.js.MapDocs(ctx, sig, []string{def.Map}, vg.Lib, docs)
 		if err != nil {
-			return nil, err
+			return nil, jsPoolError(err)
 		}
 		out := make([]bool, len(changes))
 		for i := range emits {

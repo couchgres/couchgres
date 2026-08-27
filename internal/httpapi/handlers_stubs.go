@@ -148,8 +148,8 @@ func (s *Server) nodeSystem(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// nodeStats serves the CouchDB stats tree shape with zeroed counters (real
-// metrics not implemented yet).
+// nodeStats serves the CouchDB stats tree shape. Compatibility counters remain
+// placeholders; couchgres.javascript exposes the live bounded-pool metrics.
 func (s *Server) nodeStats(w http.ResponseWriter, r *http.Request) error {
 	if err := s.requireServerAdmin(r); err != nil {
 		return err
@@ -157,6 +157,10 @@ func (s *Server) nodeStats(w http.ResponseWriter, r *http.Request) error {
 	value := func(desc string) map[string]any {
 		return map[string]any{"value": 0, "type": "counter", "desc": desc}
 	}
+	metric := func(value any, kind, desc string) map[string]any {
+		return map[string]any{"value": value, "type": kind, "desc": desc}
+	}
+	js := s.js.Stats()
 	writeJSON(w, 200, map[string]any{
 		"couchdb": map[string]any{
 			"request_time": map[string]any{"value": map[string]any{"min": 0, "max": 0, "arithmetic_mean": 0, "n": 0}, "type": "histogram", "desc": "length of a request inside CouchDB without MochiWeb"},
@@ -180,6 +184,22 @@ func (s *Server) nodeStats(w http.ResponseWriter, r *http.Request) error {
 		"pread":            map[string]any{},
 		"rexi":             map[string]any{},
 		"fsync":            map[string]any{},
+		"couchgres": map[string]any{
+			"javascript": map[string]any{
+				"workers":             metric(js.Workers, "gauge", "JavaScript worker count"),
+				"queued":              metric(js.Queued, "gauge", "calls waiting for a JavaScript worker"),
+				"active":              metric(js.Active, "gauge", "active JavaScript calls"),
+				"calls":               metric(js.Calls, "counter", "JavaScript calls started"),
+				"cached_contexts":     metric(js.CachedContexts, "gauge", "cached QuickJS contexts"),
+				"cached_source_bytes": metric(js.CachedSourceBytes, "gauge", "estimated cached design source bytes"),
+				"cache_hits":          metric(js.CacheHits, "counter", "JavaScript context cache hits"),
+				"cache_misses":        metric(js.CacheMisses, "counter", "JavaScript context cache misses"),
+				"cache_evictions":     metric(js.CacheEvictions, "counter", "JavaScript context cache evictions"),
+				"timeouts":            metric(js.Timeouts, "counter", "JavaScript execution timeouts"),
+				"memory_limits":       metric(js.MemoryLimits, "counter", "QuickJS heap limit rejections"),
+				"output_limits":       metric(js.OutputLimits, "counter", "JavaScript output limit rejections"),
+			},
+		},
 	})
 	return nil
 }

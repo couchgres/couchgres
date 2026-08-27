@@ -475,7 +475,10 @@ func TestClusterStubs(t *testing.T) {
 		t.Fatalf("system: %+v", resp)
 	}
 	resp = send(t, h, "GET", "/_node/_local/_stats", nil, testAdminAuth, admin)
-	if resp.status != 200 || resp.body["couchdb"] == nil {
+	couchgresStats, _ := resp.body["couchgres"].(map[string]any)
+	javascriptStats, _ := couchgresStats["javascript"].(map[string]any)
+	if resp.status != 200 || resp.body["couchdb"] == nil ||
+		javascriptStats["cached_contexts"] == nil || javascriptStats["cache_evictions"] == nil {
 		t.Fatalf("stats: %+v", resp)
 	}
 }

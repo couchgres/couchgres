@@ -7,6 +7,7 @@
 package jsengine
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"modernc.org/quickjs"
@@ -39,27 +41,116 @@ type ValidationError struct {
 
 func (e *ValidationError) Error() string { return e.Kind + ": " + e.Message }
 
-// ErrTimeout reports a script exceeding the wall-clock limit.
-var ErrTimeout = errors.New("JavaScript execution timed out")
+const (
+	defaultMaxWorkers           = 4
+	defaultMaxCachedContexts    = 4
+	defaultMaxCachedSourceBytes = 8 << 20
+	defaultMaxMemoryBytes       = 64 << 20
+	defaultMaxOutputBytes       = 16 << 20
+	defaultMaxEmitRows          = 100_000
+	outputLimitMarker           = "__couchgres_output_limit__"
+)
+
+var (
+	// ErrTimeout reports a script exceeding the wall-clock limit.
+	ErrTimeout = errors.New("JavaScript execution timed out")
+	// ErrMemoryLimit reports a script exhausting its QuickJS heap budget.
+	ErrMemoryLimit = errors.New("JavaScript memory limit exceeded")
+	// ErrOutputLimit reports a script producing too many bytes or emitted rows.
+	ErrOutputLimit = errors.New("JavaScript output limit exceeded")
+)
+
+// Limits bounds persistent worker state and the work produced by one call.
+// Zero values select the secure defaults used by NewPool.
+type Limits struct {
+	MaxCachedContexts    int
+	MaxCachedSourceBytes int
+	MaxMemoryBytes       int
+	MaxOutputBytes       int
+	MaxEmitRows          int
+}
+
+func (l Limits) withDefaults() Limits {
+	l.MaxCachedContexts = secureLimit(l.MaxCachedContexts, defaultMaxCachedContexts)
+	l.MaxCachedSourceBytes = secureLimit(l.MaxCachedSourceBytes, defaultMaxCachedSourceBytes)
+	l.MaxMemoryBytes = secureLimit(l.MaxMemoryBytes, defaultMaxMemoryBytes)
+	l.MaxOutputBytes = secureLimit(l.MaxOutputBytes, defaultMaxOutputBytes)
+	l.MaxEmitRows = secureLimit(l.MaxEmitRows, defaultMaxEmitRows)
+	return l
+}
+
+func secureLimit(value, ceiling int) int {
+	if value <= 0 || value > ceiling {
+		return ceiling
+	}
+	return value
+}
+
+// Stats is a point-in-time snapshot of JavaScript pool activity.
+type Stats struct {
+	Workers           int
+	Queued            int64
+	Active            int64
+	Calls             uint64
+	CachedContexts    int64
+	CachedSourceBytes int64
+	CacheHits         uint64
+	CacheMisses       uint64
+	CacheEvictions    uint64
+	Timeouts          uint64
+	MemoryLimits      uint64
+	OutputLimits      uint64
+}
+
+type poolStats struct {
+	queued            atomic.Int64
+	active            atomic.Int64
+	calls             atomic.Uint64
+	cachedContexts    atomic.Int64
+	cachedSourceBytes atomic.Int64
+	cacheHits         atomic.Uint64
+	cacheMisses       atomic.Uint64
+	cacheEvictions    atomic.Uint64
+	timeouts          atomic.Uint64
+	memoryLimits      atomic.Uint64
+	outputLimits      atomic.Uint64
+}
 
 type Pool struct {
 	jobs    chan func(*worker)
 	wg      sync.WaitGroup
 	timeout time.Duration
+	workers int
+	limits  Limits
+	stats   poolStats
 }
 
-// NewPool starts size workers (0 = GOMAXPROCS). timeout bounds each script
-// call. It is analogous to CouchDB's os_process_timeout. Zero defaults to 5s.
+// NewPool starts size workers, capped at four. Zero uses the smaller of
+// GOMAXPROCS and four so the aggregate VM-memory ceiling remains bounded on
+// large hosts. timeout bounds each script call and is analogous to CouchDB's
+// os_process_timeout. Zero defaults to 5s.
 func NewPool(size int, timeout time.Duration) *Pool {
+	return NewPoolWithLimits(size, timeout, Limits{})
+}
+
+// NewPoolWithLimits is NewPool with explicit resource limits. The hard defaults
+// remain ceilings; focused tests and embedded users can only select tighter
+// budgets.
+func NewPoolWithLimits(size int, timeout time.Duration, limits Limits) *Pool {
 	if size <= 0 {
-		size = runtime.GOMAXPROCS(0)
+		size = min(runtime.GOMAXPROCS(0), defaultMaxWorkers)
+	} else {
+		size = min(size, defaultMaxWorkers)
 	}
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	limits = limits.withDefaults()
 	p := &Pool{
 		jobs:    make(chan func(*worker)),
 		timeout: timeout,
+		workers: size,
+		limits:  limits,
 	}
 	for i := 0; i < size; i++ {
 		p.wg.Add(1)
@@ -67,6 +158,8 @@ func NewPool(size int, timeout time.Duration) *Pool {
 			defer p.wg.Done()
 			w := &worker{
 				timeout:  timeout,
+				limits:   limits,
+				stats:    &p.stats,
 				contexts: make(map[string]*workerContext),
 			}
 			defer w.dispose()
@@ -76,6 +169,24 @@ func NewPool(size int, timeout time.Duration) *Pool {
 		}()
 	}
 	return p
+}
+
+// Stats returns current gauges and cumulative counters for this pool.
+func (p *Pool) Stats() Stats {
+	return Stats{
+		Workers:           p.workers,
+		Queued:            p.stats.queued.Load(),
+		Active:            p.stats.active.Load(),
+		Calls:             p.stats.calls.Load(),
+		CachedContexts:    p.stats.cachedContexts.Load(),
+		CachedSourceBytes: p.stats.cachedSourceBytes.Load(),
+		CacheHits:         p.stats.cacheHits.Load(),
+		CacheMisses:       p.stats.cacheMisses.Load(),
+		CacheEvictions:    p.stats.cacheEvictions.Load(),
+		Timeouts:          p.stats.timeouts.Load(),
+		MemoryLimits:      p.stats.memoryLimits.Load(),
+		OutputLimits:      p.stats.outputLimits.Load(),
+	}
 }
 
 // Close stops the workers and frees the VMs.
@@ -90,15 +201,21 @@ func (p *Pool) Close() {
 func (p *Pool) exec(ctx context.Context, fn func(*worker) error) error {
 	done := make(chan error, 1)
 	job := func(w *worker) {
+		p.stats.queued.Add(-1)
 		if err := ctx.Err(); err != nil {
 			done <- err
 			return
 		}
+		p.stats.calls.Add(1)
+		p.stats.active.Add(1)
+		defer p.stats.active.Add(-1)
 		done <- fn(w)
 	}
+	p.stats.queued.Add(1)
 	select {
 	case p.jobs <- job:
 	case <-ctx.Done():
+		p.stats.queued.Add(-1)
 		return ctx.Err()
 	}
 	select {
@@ -122,10 +239,11 @@ func (p *Pool) MapDocs(ctx context.Context, sig string, fns []string, lib map[st
 	}
 	var raw [][][][2]json.RawMessage
 	err = p.exec(ctx, func(w *worker) error {
-		c, err := w.context(ctx, sig, fns, lib)
+		c, release, err := w.context(ctx, sig, fns, lib, 0)
 		if err != nil {
 			return err
 		}
+		defer release()
 		out, err := w.call(ctx, c, string(payload), "__map")
 		if err != nil {
 			return err
@@ -168,10 +286,11 @@ func (p *Pool) ReduceGroups(ctx context.Context, sig, fn string, groups []Reduce
 	}
 	var out []json.RawMessage
 	err = p.exec(ctx, func(w *worker) error {
-		c, err := w.context(ctx, sig, nil, nil)
+		c, release, err := w.context(ctx, sig, nil, nil, len(fn))
 		if err != nil {
 			return err
 		}
+		defer release()
 		res, err := w.call(ctx, c, string(payload), "__reduce")
 		if err != nil {
 			return err
@@ -201,10 +320,11 @@ func (p *Pool) FilterDocs(ctx context.Context, sig, fn string, docs []json.RawMe
 	}
 	var out []bool
 	err = p.exec(ctx, func(w *worker) error {
-		c, err := w.context(ctx, sig, nil, nil)
+		c, release, err := w.context(ctx, sig, nil, nil, len(fn)+len(ddoc))
 		if err != nil {
 			return err
 		}
+		defer release()
 		res, err := w.call(ctx, c, string(payload), "__filter")
 		if err != nil {
 			return err
@@ -229,10 +349,11 @@ func (p *Pool) DDocCall(ctx context.Context, sig, fn string, args []json.RawMess
 	}
 	var out json.RawMessage
 	err = p.exec(ctx, func(w *worker) error {
-		c, err := w.context(ctx, sig, nil, nil)
+		c, release, err := w.context(ctx, sig, nil, nil, len(fn)+len(ddoc))
 		if err != nil {
 			return err
 		}
+		defer release()
 		res, err := w.call(ctx, c, string(payload), "__ddocfn")
 		if err != nil {
 			return err
@@ -268,7 +389,7 @@ func (p *Pool) Show(ctx context.Context, sig, fn string, doc, req, ddoc json.Raw
 	if err != nil {
 		return nil, err
 	}
-	return p.render(ctx, sig, payload, "__show")
+	return p.render(ctx, sig, payload, "__show", len(fn)+len(ddoc))
 }
 
 // List runs a list function over pre-materialized view rows.
@@ -282,16 +403,17 @@ func (p *Pool) List(ctx context.Context, sig, fn string, head, req, ddoc json.Ra
 	if err != nil {
 		return nil, err
 	}
-	return p.render(ctx, sig, payload, "__list")
+	return p.render(ctx, sig, payload, "__list", len(fn)+len(ddoc))
 }
 
-func (p *Pool) render(ctx context.Context, sig string, payload []byte, fn string) (*RenderResult, error) {
+func (p *Pool) render(ctx context.Context, sig string, payload []byte, fn string, sourceBytes int) (*RenderResult, error) {
 	var out RenderResult
 	err := p.exec(ctx, func(w *worker) error {
-		c, err := w.context(ctx, sig, nil, nil)
+		c, release, err := w.context(ctx, sig, nil, nil, sourceBytes)
 		if err != nil {
 			return err
 		}
+		defer release()
 		res, err := w.call(ctx, c, string(payload), fn)
 		if err != nil {
 			return err
@@ -321,10 +443,11 @@ func (p *Pool) Validate(ctx context.Context, sig, fn string, newDoc, oldDoc, use
 		return err
 	}
 	return p.exec(ctx, func(w *worker) error {
-		c, err := w.context(ctx, sig, nil, nil)
+		c, release, err := w.context(ctx, sig, nil, nil, len(fn)+len(ddoc))
 		if err != nil {
 			return err
 		}
+		defer release()
 		res, err := w.call(ctx, c, string(payload), "__validate")
 		if err != nil {
 			return err
@@ -349,8 +472,12 @@ func (p *Pool) Validate(ctx context.Context, sig, fn string, newDoc, oldDoc, use
 // worker owns one VM per design-doc signature. All methods run on the
 // worker's goroutine only (VMs are not concurrency-safe).
 type worker struct {
-	contexts map[string]*workerContext
-	timeout  time.Duration
+	contexts          map[string]*workerContext
+	lru               list.List
+	cachedSourceBytes int
+	timeout           time.Duration
+	limits            Limits
+	stats             *poolStats
 }
 
 // workerContext is a cached per-signature VM. Contexts are created by
@@ -358,52 +485,169 @@ type worker struct {
 // makes one without the view functions. Whether views are installed is
 // tracked separately and installation happens when a map call needs it.
 type workerContext struct {
+	sig            string
 	vm             *quickjs.VM
 	viewsInstalled bool
+	sourceBytes    int
+	cached         bool
+	closed         bool
+	lruElement     *list.Element
 }
 
 func (w *worker) dispose() {
-	for _, c := range w.contexts {
-		c.vm.Close()
+	for w.lru.Len() > 0 {
+		w.closeContext(w.lru.Back().Value.(*workerContext))
 	}
 	w.contexts = nil
 }
 
 // context returns the cached VM for sig, creating it on first use and
 // installing the ddoc's view functions the first time a caller passes them.
-func (w *worker) context(ctx context.Context, sig string, fns []string, lib map[string]any) (*workerContext, error) {
-	entry, ok := w.contexts[sig]
-	if !ok {
-		vm, err := quickjs.NewVM()
+// The returned release closes contexts that are deliberately not cached
+// because their source is larger than the cache's byte budget.
+func (w *worker) context(
+	ctx context.Context,
+	sig string,
+	fns []string,
+	lib map[string]any,
+	extraSourceBytes int,
+) (*workerContext, func(), error) {
+	entry, hit := w.contexts[sig]
+	installViews := (len(fns) > 0 || lib != nil) && (!hit || !entry.viewsInstalled)
+	var installPayload []byte
+	if installViews {
+		var err error
+		installPayload, err = json.Marshal(map[string]any{"views": fns, "lib": lib})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if err := vm.SetEvalTimeout(w.timeout); err != nil {
-			vm.Close()
-			return nil, err
-		}
-		if _, err := vm.Eval(runtimeJS, quickjs.EvalGlobal); err != nil {
-			vm.Close()
-			return nil, fmt.Errorf("installing view-server runtime: %w", err)
-		}
-		entry = &workerContext{vm: vm}
-		w.contexts[sig] = entry
 	}
-	if (len(fns) > 0 || lib != nil) && !entry.viewsInstalled {
-		payload, err := json.Marshal(map[string]any{"views": fns, "lib": lib})
-		if err != nil {
-			return nil, err
+	sourceBytes := max(1, len(sig)+extraSourceBytes+len(installPayload))
+
+	if hit {
+		w.stats.cacheHits.Add(1)
+		w.lru.MoveToFront(entry.lruElement)
+		desiredBytes := max(entry.sourceBytes, sourceBytes)
+		if desiredBytes > entry.sourceBytes {
+			delta := desiredBytes - entry.sourceBytes
+			if desiredBytes > w.limits.MaxCachedSourceBytes ||
+				!w.makeRoom(entry, 0, delta) {
+				// Keep using the VM for this call, but stop retaining it.
+				w.stats.cacheEvictions.Add(1)
+				w.detachContext(entry)
+			} else {
+				entry.sourceBytes = desiredBytes
+				w.cachedSourceBytes += delta
+				w.stats.cachedSourceBytes.Add(int64(delta))
+			}
 		}
-		if _, err := w.call(ctx, entry, string(payload), "__install"); err != nil {
+	} else {
+		w.stats.cacheMisses.Add(1)
+		cache := sourceBytes <= w.limits.MaxCachedSourceBytes &&
+			w.makeRoom(nil, 1, sourceBytes)
+		var err error
+		entry, err = w.newContext(sig, sourceBytes)
+		if err != nil {
+			return nil, nil, err
+		}
+		if cache {
+			w.cacheContext(entry)
+		}
+	}
+
+	if installViews {
+		if _, err := w.call(ctx, entry, string(installPayload), "__install"); err != nil {
 			// The VM may hold half-installed state. Drop it so the next
 			// call starts clean instead of serving empty maps.
-			entry.vm.Close()
-			delete(w.contexts, sig)
-			return nil, fmt.Errorf("compiling design doc functions: %w", err)
+			w.closeContext(entry)
+			return nil, nil, fmt.Errorf("compiling design doc functions: %w", err)
 		}
 		entry.viewsInstalled = true
 	}
+	return entry, func() {
+		if !entry.cached {
+			w.closeContext(entry)
+		}
+	}, nil
+}
+
+func (w *worker) newContext(sig string, sourceBytes int) (*workerContext, error) {
+	vm, err := quickjs.NewVM()
+	if err != nil {
+		return nil, err
+	}
+	entry := &workerContext{sig: sig, vm: vm, sourceBytes: sourceBytes}
+	vm.SetMemoryLimit(uintptr(w.limits.MaxMemoryBytes))
+	vm.SetGCThreshold(uintptr(w.limits.MaxMemoryBytes / 2))
+	if err := vm.SetEvalTimeout(w.timeout); err != nil {
+		w.closeContext(entry)
+		return nil, err
+	}
+	if _, err := vm.Eval(runtimeJS, quickjs.EvalGlobal); err != nil {
+		mapped := w.vmError(context.Background(), entry, err)
+		w.closeContext(entry)
+		return nil, fmt.Errorf("installing view-server runtime: %w", mapped)
+	}
+	if _, err := vm.Call("__configureCouchgresRuntime", w.limits.MaxEmitRows); err != nil {
+		mapped := w.vmError(context.Background(), entry, err)
+		w.closeContext(entry)
+		return nil, fmt.Errorf("configuring view-server runtime: %w", mapped)
+	}
+	if _, err := vm.Eval("delete globalThis.__configureCouchgresRuntime", quickjs.EvalGlobal); err != nil {
+		mapped := w.vmError(context.Background(), entry, err)
+		w.closeContext(entry)
+		return nil, fmt.Errorf("sealing view-server runtime: %w", mapped)
+	}
 	return entry, nil
+}
+
+func (w *worker) cacheContext(entry *workerContext) {
+	entry.cached = true
+	entry.lruElement = w.lru.PushFront(entry)
+	w.contexts[entry.sig] = entry
+	w.cachedSourceBytes += entry.sourceBytes
+	w.stats.cachedContexts.Add(1)
+	w.stats.cachedSourceBytes.Add(int64(entry.sourceBytes))
+}
+
+func (w *worker) detachContext(entry *workerContext) {
+	if !entry.cached {
+		return
+	}
+	delete(w.contexts, entry.sig)
+	w.lru.Remove(entry.lruElement)
+	entry.lruElement = nil
+	entry.cached = false
+	w.cachedSourceBytes -= entry.sourceBytes
+	w.stats.cachedContexts.Add(-1)
+	w.stats.cachedSourceBytes.Add(-int64(entry.sourceBytes))
+}
+
+func (w *worker) closeContext(entry *workerContext) {
+	if entry == nil || entry.closed {
+		return
+	}
+	w.detachContext(entry)
+	_ = entry.vm.Close()
+	entry.closed = true
+}
+
+// makeRoom evicts least-recently-used contexts until adding the requested
+// entry/source bytes fits. keep is the current context while its charge grows.
+func (w *worker) makeRoom(keep *workerContext, entries, sourceBytes int) bool {
+	for len(w.contexts)+entries > w.limits.MaxCachedContexts ||
+		w.cachedSourceBytes+sourceBytes > w.limits.MaxCachedSourceBytes {
+		candidate := w.lru.Back()
+		if candidate != nil && candidate.Value.(*workerContext) == keep {
+			candidate = candidate.Prev()
+		}
+		if candidate == nil {
+			return false
+		}
+		w.stats.cacheEvictions.Add(1)
+		w.closeContext(candidate.Value.(*workerContext))
+	}
+	return true
 }
 
 // call invokes a runtime entry point (__map, __reduce, etc.) with the
@@ -414,7 +658,7 @@ func (w *worker) call(ctx context.Context, c *workerContext, payload, fn string)
 	// modernc.org/quickjs only re-arms its eval timeout in Eval, not Call, so
 	// run a no-op Eval before every Call on a VM that may have been idle.
 	if _, err := c.vm.Eval("0", quickjs.EvalGlobal); err != nil {
-		return "", scriptError(err)
+		return "", w.vmError(ctx, c, err)
 	}
 	// Arm after re-arm so configureInterrupt cannot clear a pending cancel.
 	stop := make(chan struct{})
@@ -431,13 +675,37 @@ func (w *worker) call(ctx context.Context, c *workerContext, payload, fn string)
 	}
 	out, err := c.vm.Call(fn, payload)
 	if err != nil {
-		return "", scriptError(err)
+		return "", w.vmError(ctx, c, err)
 	}
 	s, ok := out.(string)
 	if !ok {
 		return "", fmt.Errorf("runtime %s returned %T, want string", fn, out)
 	}
+	if len(s) > w.limits.MaxOutputBytes {
+		w.stats.outputLimits.Add(1)
+		return "", fmt.Errorf("%w: %d bytes exceeds %d", ErrOutputLimit,
+			len(s), w.limits.MaxOutputBytes)
+	}
 	return s, nil
+}
+
+func (w *worker) vmError(ctx context.Context, entry *workerContext, err error) error {
+	mapped := scriptError(err)
+	switch {
+	case errors.Is(mapped, ErrTimeout):
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		w.stats.timeouts.Add(1)
+	case errors.Is(mapped, ErrMemoryLimit):
+		w.stats.memoryLimits.Add(1)
+		// An OOM can leave arbitrary persistent global state. Rebuild rather
+		// than returning that VM to the cache.
+		w.closeContext(entry)
+	case errors.Is(mapped, ErrOutputLimit):
+		w.stats.outputLimits.Add(1)
+	}
+	return mapped
 }
 
 // scriptError maps a QuickJS evaluation error. The interrupt handler's
@@ -447,6 +715,14 @@ func scriptError(err error) error {
 	msg := err.Error()
 	if strings.Contains(msg, "InternalError: interrupted") {
 		return ErrTimeout
+	}
+	if strings.Contains(msg, outputLimitMarker) {
+		return fmt.Errorf("%w: emitted-row limit reached", ErrOutputLimit)
+	}
+	lower := strings.ToLower(msg)
+	if msg == "null" || strings.Contains(lower, "out of memory") ||
+		strings.Contains(lower, "string too long") {
+		return fmt.Errorf("%w: QuickJS heap exhausted", ErrMemoryLimit)
 	}
 	return fmt.Errorf("JavaScript error: %s", msg)
 }

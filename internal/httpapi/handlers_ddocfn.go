@@ -262,6 +262,9 @@ func (s *Server) showHandler(w http.ResponseWriter, r *http.Request) error {
 	}
 	result, err := s.js.Show(r.Context(), sig, src, docRaw, reqRaw, ddocJSON(ddoc))
 	if err != nil {
+		if isJSProcessError(err) {
+			return jsPoolError(err)
+		}
 		var re *jsengine.RenderError
 		if errors.As(err, &re) {
 			return couch.NewError(re.Code, re.Name, re.Reason)
@@ -319,6 +322,9 @@ func (s *Server) updateHandler(w http.ResponseWriter, r *http.Request) error {
 	}
 	result, err := s.js.DDocCall(r.Context(), sig, src, []json.RawMessage{docRaw, reqRaw}, ddocJSON(ddoc))
 	if err != nil {
+		if isJSProcessError(err) {
+			return jsPoolError(err)
+		}
 		return couch.NewError(500, "render_error", err.Error())
 	}
 	var pair []json.RawMessage
@@ -500,6 +506,9 @@ func (s *Server) listHandler(w http.ResponseWriter, r *http.Request) error {
 	}
 	listResult, err := s.js.List(r.Context(), sig, src, head, reqRaw, ddocJSON(ddoc), rows)
 	if err != nil {
+		if isJSProcessError(err) {
+			return jsPoolError(err)
+		}
 		var re *jsengine.RenderError
 		if errors.As(err, &re) {
 			return couch.NewError(re.Code, re.Name, re.Reason)
@@ -761,6 +770,9 @@ func (s *Server) applyRewriteFunction(r *http.Request, db *store.DB, ddoc *store
 	}
 	result, err := s.js.DDocCall(r.Context(), sig, src, []json.RawMessage{reqRaw}, ddocJSON(ddoc))
 	if err != nil {
+		if isJSProcessError(err) {
+			return nil, jsPoolError(err)
+		}
 		return nil, couch.NewError(500, "render_error", err.Error())
 	}
 	var asString string

@@ -25,7 +25,16 @@ func jsPoolError(err error) error {
 	if errors.Is(err, jsengine.ErrTimeout) {
 		return couch.NewError(500, "os_process_error", "OS process timed out.")
 	}
+	if errors.Is(err, jsengine.ErrMemoryLimit) || errors.Is(err, jsengine.ErrOutputLimit) {
+		return couch.NewError(500, "os_process_error", "OS process exceeded resource limit.")
+	}
 	return err
+}
+
+func isJSProcessError(err error) bool {
+	return errors.Is(err, jsengine.ErrTimeout) ||
+		errors.Is(err, jsengine.ErrMemoryLimit) ||
+		errors.Is(err, jsengine.ErrOutputLimit)
 }
 
 func (m jsMapper) MapDocs(ctx context.Context, sig string, fns []string, lib map[string]any, docs []json.RawMessage) ([][][]store.ViewEmit, error) {

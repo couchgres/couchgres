@@ -76,6 +76,18 @@ CouchDB-style settings are stored in PostgreSQL and exposed through `/_node/_loc
 | `chttpd/secure_rewrites`                                                  | Defaults to `true`, restricting array and function rewrites to the source database and original HTTP method. With `false`, cross-scope or method-changing rewrites still require a server administrator.                |
 | `couchgres_httpd/max_{small,query,document,bulk,attachment}_request_size` | Route-specific request-body ceilings. Defaults to 64 KiB, 1 MiB, 16 MiB, 64 MiB, and 64 MiB respectively; the global ceiling always wins.                                                                               |
 
+### JavaScript resource limits
+
+Design-document JavaScript runs in a pool of at most four QuickJS workers by
+default. Each worker retains at most four least-recently-used contexts and 8 MiB
+of estimated design source. Every VM has a 64 MiB heap ceiling, and each call is
+limited to 16 MiB of serialized output and 100,000 emitted view rows. Evicted,
+oversized, and memory-exhausted contexts are closed rather than retained.
+
+Live worker, queue, cache, eviction, timeout, memory-limit, and output-limit
+counters are available to server administrators under `couchgres.javascript`
+in `GET /_node/_local/_stats`.
+
 ## Performance and Benchmarks
 
 ### Overview

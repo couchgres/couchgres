@@ -161,6 +161,9 @@ func (s *Server) validateDocUpdate(
 			}
 			return couch.Forbidden(verr.Message)
 		}
+		if isJSProcessError(err) {
+			return jsPoolError(err)
+		}
 		return couch.NewError(500, "unknown_error",
 			"validation function "+fn.ddocID+": "+err.Error())
 	}

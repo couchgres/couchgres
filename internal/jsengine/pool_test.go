@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -310,6 +311,143 @@ func TestBigBatch(t *testing.T) {
 	}
 	if len(out) != 500 || string(out[499][0][0].Value) != `998` {
 		t.Fatalf("big batch: %d rows, last %s", len(out), out[499][0][0].Value)
+	}
+}
+
+func TestResourceCeilingsCannotBeWidened(t *testing.T) {
+	p := NewPoolWithLimits(100, 2*time.Second, Limits{
+		MaxCachedContexts:    defaultMaxCachedContexts + 1,
+		MaxCachedSourceBytes: defaultMaxCachedSourceBytes + 1,
+		MaxMemoryBytes:       defaultMaxMemoryBytes + 1,
+		MaxOutputBytes:       defaultMaxOutputBytes + 1,
+		MaxEmitRows:          defaultMaxEmitRows + 1,
+	})
+	defer p.Close()
+	if p.Stats().Workers != defaultMaxWorkers {
+		t.Fatalf("worker ceiling widened: %+v", p.Stats())
+	}
+	if p.limits != (Limits{
+		MaxCachedContexts:    defaultMaxCachedContexts,
+		MaxCachedSourceBytes: defaultMaxCachedSourceBytes,
+		MaxMemoryBytes:       defaultMaxMemoryBytes,
+		MaxOutputBytes:       defaultMaxOutputBytes,
+		MaxEmitRows:          defaultMaxEmitRows,
+	}) {
+		t.Fatalf("resource ceilings widened: %+v", p.limits)
+	}
+}
+
+func TestContextCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	p := NewPoolWithLimits(1, 2*time.Second, Limits{MaxCachedContexts: 2})
+	defer p.Close()
+	doc := []json.RawMessage{raw(`{"_id":"a"}`)}
+	mapSig := func(sig string) {
+		t.Helper()
+		if _, err := p.MapDocs(context.Background(), sig,
+			[]string{`function(doc) { emit(doc._id, null); }`}, nil, doc); err != nil {
+			t.Fatalf("map %s: %v", sig, err)
+		}
+	}
+
+	mapSig("one")
+	mapSig("two")
+	mapSig("one") // make two the least-recently-used context
+	mapSig("three")
+
+	stats := p.Stats()
+	if stats.CachedContexts != 2 || stats.CacheHits != 1 ||
+		stats.CacheMisses != 3 || stats.CacheEvictions != 1 {
+		t.Fatalf("cache stats after eviction: %+v", stats)
+	}
+	if err := p.exec(context.Background(), func(w *worker) error {
+		_, hasOne := w.contexts["one"]
+		_, hasTwo := w.contexts["two"]
+		_, hasThree := w.contexts["three"]
+		if !hasOne || hasTwo || !hasThree {
+			return fmt.Errorf("wrong LRU survivors: one=%t two=%t three=%t",
+				hasOne, hasTwo, hasThree)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOversizedSourceIsNotCached(t *testing.T) {
+	p := NewPoolWithLimits(1, 2*time.Second, Limits{MaxCachedSourceBytes: 32})
+	defer p.Close()
+	fn := `function(doc) { emit(doc._id, "source larger than cache budget"); }`
+	docs := []json.RawMessage{raw(`{"_id":"a"}`)}
+	for i := 0; i < 2; i++ {
+		if _, err := p.MapDocs(context.Background(), "large-source", []string{fn}, nil, docs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats := p.Stats()
+	if stats.CachedContexts != 0 || stats.CachedSourceBytes != 0 || stats.CacheMisses != 2 {
+		t.Fatalf("oversized context was retained: %+v", stats)
+	}
+}
+
+func TestEmitRowLimit(t *testing.T) {
+	p := NewPoolWithLimits(1, 2*time.Second, Limits{MaxEmitRows: 2})
+	defer p.Close()
+	_, err := p.MapDocs(context.Background(), "too-many-emits",
+		[]string{`function(doc) {
+			__maxEmits = 1000000;
+			__emitCount = 0;
+			emit = function() {};
+			emit(1, null); emit(2, null); emit(3, null);
+		}`}, nil,
+		[]json.RawMessage{raw(`{}`)})
+	if !errors.Is(err, ErrOutputLimit) {
+		t.Fatalf("want ErrOutputLimit, got %v", err)
+	}
+	if stats := p.Stats(); stats.OutputLimits != 1 {
+		t.Fatalf("output-limit stats: %+v", stats)
+	}
+
+	// A resource-limit exception must not poison the worker.
+	out, err := p.MapDocs(context.Background(), "after-emit-limit",
+		[]string{`function(doc) { emit(1, null); }`}, nil,
+		[]json.RawMessage{raw(`{}`)})
+	if err != nil || len(out[0][0]) != 1 {
+		t.Fatalf("pool did not recover after emit limit: %v %+v", err, out)
+	}
+}
+
+func TestSerializedOutputLimitCoversReduce(t *testing.T) {
+	p := NewPoolWithLimits(1, 2*time.Second, Limits{MaxOutputBytes: 64})
+	defer p.Close()
+	_, err := p.ReduceGroups(context.Background(), "large-reduce",
+		`function(keys, values) { return Array(200).join("x"); }`,
+		[]ReduceGroup{{Values: []json.RawMessage{raw(`1`)}}}, false)
+	if !errors.Is(err, ErrOutputLimit) {
+		t.Fatalf("want ErrOutputLimit, got %v", err)
+	}
+}
+
+func TestQuickJSMemoryLimit(t *testing.T) {
+	p := NewPoolWithLimits(1, 5*time.Second, Limits{MaxMemoryBytes: 2 << 20})
+	defer p.Close()
+	_, err := p.DDocCall(context.Background(), "memory-limit",
+		`function(doc) {
+			var values = [];
+			while (true) values.push({n: values.length});
+		}`, []json.RawMessage{raw(`{}`)}, nil)
+	if !errors.Is(err, ErrMemoryLimit) {
+		t.Fatalf("want ErrMemoryLimit, got %v", err)
+	}
+	stats := p.Stats()
+	if stats.MemoryLimits != 1 || stats.CachedContexts != 0 {
+		t.Fatalf("memory-limit stats/context cleanup: %+v", stats)
+	}
+
+	out, err := p.MapDocs(context.Background(), "after-memory-limit",
+		[]string{`function(doc) { emit(1, null); }`}, nil,
+		[]json.RawMessage{raw(`{}`)})
+	if err != nil || len(out[0][0]) != 1 {
+		t.Fatalf("pool did not recover after memory limit: %v %+v", err, out)
 	}
 }
 

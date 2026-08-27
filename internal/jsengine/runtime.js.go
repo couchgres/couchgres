@@ -6,13 +6,32 @@ package jsengine
 // as one JSON string per batch, not per document.
 const runtimeJS = `
 'use strict';
+(function() {
 var __views = [];
 var __lib = {};
 var __fnCache = {};
 var __emitted = null;
+var __emitCount = 0;
+var __maxEmits = 100000;
+var __mapActive = false;
+var __outputLimitMarker = '` + outputLimitMarker + `';
+
+function __isResourceLimit(e) {
+	// QuickJS reports allocation failure as a null exception when it cannot
+	// reserve enough heap to construct an InternalError.
+	if (e === null) return true;
+	var msg = String(e);
+	return msg.indexOf(__outputLimitMarker) !== -1 ||
+		msg.toLowerCase().indexOf('out of memory') !== -1 ||
+		msg.toLowerCase().indexOf('string too long') !== -1;
+}
 
 // CouchDB view-server globals available to user functions.
 function emit(key, value) {
+	if (__emitCount >= __maxEmits) {
+		throw new Error(__outputLimitMarker + ': emitted-row limit reached');
+	}
+	__emitCount++;
 	__emitted.push([key === undefined ? null : key, value === undefined ? null : value]);
 }
 function sum(values) {
@@ -74,23 +93,35 @@ function __install(__in) {
 // __map: [doc, ...] -> per doc, per view fn, the emitted [key, value] rows.
 // A throwing map function skips that doc for that view (CouchDB behavior).
 function __map(__in) {
+	if (__mapActive) {
+		throw new Error(__outputLimitMarker + ': nested map invocation');
+	}
+	__mapActive = true;
 	var docs = JSON.parse(__in);
 	var out = [];
-	for (var d = 0; d < docs.length; d++) {
-		var perView = [];
-		// Each view fn gets its own copy of the doc: one map function
-		// mutating doc must not leak into the next (COUCHDB-925).
-		var raw = __views.length > 1 ? JSON.stringify(docs[d]) : null;
-		for (var v = 0; v < __views.length; v++) {
-			var doc = v === 0 ? docs[d] : JSON.parse(raw);
-			__emitted = [];
-			try { __views[v](doc); } catch (e) { __emitted = []; }
-			perView.push(__emitted);
+	__emitCount = 0;
+	try {
+		for (var d = 0; d < docs.length; d++) {
+			var perView = [];
+			// Each view fn gets its own copy of the doc: one map function
+			// mutating doc must not leak into the next (COUCHDB-925).
+			var raw = __views.length > 1 ? JSON.stringify(docs[d]) : null;
+			for (var v = 0; v < __views.length; v++) {
+				var doc = v === 0 ? docs[d] : JSON.parse(raw);
+				__emitted = [];
+				try { __views[v](doc); } catch (e) {
+					if (__isResourceLimit(e)) throw e;
+					__emitted = [];
+				}
+				perView.push(__emitted);
+			}
+			out.push(perView);
 		}
-		out.push(perView);
+		return JSON.stringify(out);
+	} finally {
+		__emitted = null;
+		__mapActive = false;
 	}
-	__emitted = null;
-	return JSON.stringify(out);
 }
 
 // __reduce: {src, groups: [{keys, values}], rereduce} -> one value per group.
@@ -122,7 +153,10 @@ function __filter(__in) {
 	var out = [];
 	for (var i = 0; i < p.docs.length; i++) {
 		var pass;
-		try { pass = !!f.call(self, p.docs[i], p.req); } catch (e) { pass = false; }
+		try { pass = !!f.call(self, p.docs[i], p.req); } catch (e) {
+			if (__isResourceLimit(e)) throw e;
+			pass = false;
+		}
 		out.push(pass);
 	}
 	return JSON.stringify(out);
@@ -160,7 +194,8 @@ var __defaultMimes = {
 	json: ['application/json', 'text/x-json']
 };
 var __mimes = null, __providers = null, __chunks = null, __resp = null;
-var getRow = null;
+var __getRow = null;
+function getRow() { return __getRow ? __getRow() : null; }
 
 function registerType(key) {
 	var mimes = [];
@@ -304,11 +339,11 @@ function __list(__in) {
 	var self = __setDDoc(p);
 	var f = __compile(p.src);
 	var i = 0;
-	getRow = function() { return i < p.rows.length ? p.rows[i++] : null; };
+	__getRow = function() { return i < p.rows.length ? p.rows[i++] : null; };
 	try {
 		return JSON.stringify(__render(f, self, [p.head, p.req], p.req));
 	} finally {
-		getRow = null;
+		__getRow = null;
 	}
 }
 
@@ -322,9 +357,44 @@ function __validate(__in) {
 		f.call(self, p.newDoc, p.oldDoc, p.userCtx, p.secObj);
 		return 'null';
 	} catch (e) {
+		if (__isResourceLimit(e)) throw e;
 		if (e && e.forbidden !== undefined) return JSON.stringify({forbidden: String(e.forbidden)});
 		if (e && e.unauthorized !== undefined) return JSON.stringify({unauthorized: String(e.unauthorized)});
 		return JSON.stringify({forbidden: String(e)});
 	}
 }
+
+function __expose(name, value) {
+	Object.defineProperty(globalThis, name, {
+		value: value, writable: false, configurable: false, enumerable: false
+	});
+}
+
+// User functions compile in the global realm, so expose only their supported
+// CouchDB API and the entry points called by Go. Mutable counters and budgets
+// stay in this closure and cannot be reset by design-document code.
+__expose('emit', emit);
+__expose('sum', sum);
+__expose('log', log);
+__expose('toJSON', toJSON);
+__expose('isArray', isArray);
+__expose('require', require);
+__expose('registerType', registerType);
+__expose('provides', provides);
+__expose('send', send);
+__expose('start', start);
+__expose('getRow', getRow);
+__expose('__install', __install);
+__expose('__map', __map);
+__expose('__reduce', __reduce);
+__expose('__filter', __filter);
+__expose('__ddocfn', __ddocfn);
+__expose('__show', __show);
+__expose('__list', __list);
+__expose('__validate', __validate);
+Object.defineProperty(globalThis, '__configureCouchgresRuntime', {
+	value: function(maxEmits) { __maxEmits = maxEmits; },
+	writable: false, configurable: true, enumerable: false
+});
+})();
 `
