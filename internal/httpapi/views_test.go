@@ -331,6 +331,173 @@ func TestValidateDocUpdate(t *testing.T) {
 	}
 }
 
+func TestBulkDocsBatchesVDUState(t *testing.T) {
+	s := testServer(t, testHTTPStore(t))
+	admin := adminAuth()
+	for _, tc := range []struct {
+		name          string
+		db            string
+		installVDU    bool
+		anonymous     bool
+		oldDocBatches uint64
+		securityReads uint64
+	}{
+		{name: "without VDU", db: "vvdu_bulk_none"},
+		{
+			name: "without VDU as member", db: "vvdu_bulk_none_member",
+			anonymous: true, securityReads: 1,
+		},
+		{
+			name: "with VDU", db: "vvdu_bulk_rules", installVDU: true,
+			oldDocBatches: 1, securityReads: 1,
+		},
+		{
+			name: "with VDU as member", db: "vvdu_bulk_rules_member",
+			installVDU: true, anonymous: true, oldDocBatches: 1, securityReads: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			send(t, s, "DELETE", "/"+tc.db, nil, testAdminAuth, admin)
+			if resp := send(t, s, "PUT", "/"+tc.db, nil,
+				testAdminAuth, admin); resp.status != 201 {
+				t.Fatalf("create database: %+v", resp)
+			}
+			t.Cleanup(func() {
+				send(t, s, "DELETE", "/"+tc.db, nil, testAdminAuth, admin)
+			})
+			if tc.installVDU {
+				body := map[string]any{
+					"validate_doc_update": "function(newDoc){ if (!newDoc.author) throw({forbidden: 'author required'}); }",
+				}
+				if resp := send(t, s, "PUT", "/"+tc.db+"/_design/rules", body,
+					testAdminAuth, admin); resp.status != 201 {
+					t.Fatalf("install VDU: %+v", resp)
+				}
+			}
+			if tc.anonymous {
+				openSecurity(t, s, tc.db)
+			}
+
+			const nDocs = 500
+			docs := make([]any, nDocs)
+			for i := range docs {
+				docs[i] = map[string]any{
+					"_id": fmt.Sprintf("doc-%03d", i), "author": "rob",
+				}
+			}
+			before := s.vdu.stats()
+			headers := []string{testAdminAuth, admin}
+			if tc.anonymous {
+				headers = nil
+			}
+			resp := send(t, s, "POST", "/"+tc.db+"/_bulk_docs",
+				map[string]any{"docs": docs}, headers...)
+			after := s.vdu.stats()
+			if resp.status != 201 || len(resp.array) != nDocs {
+				t.Fatalf("bulk response: status=%d rows=%d", resp.status, len(resp.array))
+			}
+			for i, value := range resp.array {
+				row := value.(map[string]any)
+				if row["ok"] != true {
+					t.Fatalf("bulk row %d: %+v", i, row)
+				}
+			}
+			if got := after.DesignProbes - before.DesignProbes; got != 1 {
+				t.Fatalf("design probes = %d, want 1", got)
+			}
+			if got := after.OldDocBatches - before.OldDocBatches; got != tc.oldDocBatches {
+				t.Fatalf("old-winner batches = %d, want %d", got, tc.oldDocBatches)
+			}
+			if got := after.SecurityReads - before.SecurityReads; got != tc.securityReads {
+				t.Fatalf("security reads = %d, want %d", got, tc.securityReads)
+			}
+		})
+	}
+}
+
+func TestBulkDocsVDUDesignSnapshotIsImmutable(t *testing.T) {
+	s := testServer(t, testHTTPStore(t))
+	admin := adminAuth()
+	const db = "vvdu_bulk_design_snapshot"
+	send(t, s, "DELETE", "/"+db, nil, testAdminAuth, admin)
+	if resp := send(t, s, "PUT", "/"+db, nil, testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("create database: %+v", resp)
+	}
+	t.Cleanup(func() { send(t, s, "DELETE", "/"+db, nil, testAdminAuth, admin) })
+
+	// A VDU created by this request must not govern a later document in the
+	// same request. Every document sees the request-start design snapshot.
+	resp := send(t, s, "POST", "/"+db+"/_bulk_docs", map[string]any{
+		"docs": []any{
+			map[string]any{
+				"_id":                 "_design/rules",
+				"validate_doc_update": "function(newDoc){ if (newDoc._id.indexOf('_design/') !== 0 && !newDoc.author) throw({forbidden: 'author required'}); }",
+			},
+			map[string]any{"_id": "before-rules", "value": 1},
+		},
+	}, testAdminAuth, admin)
+	if resp.status != 201 || len(resp.array) != 2 {
+		t.Fatalf("snapshot bulk response: %+v", resp)
+	}
+	for i, value := range resp.array {
+		if row := value.(map[string]any); row["ok"] != true {
+			t.Fatalf("snapshot bulk row %d: %+v", i, row)
+		}
+	}
+
+	resp = send(t, s, "PUT", "/"+db+"/after-rules",
+		map[string]any{"value": 2}, testAdminAuth, admin)
+	if resp.status != 403 || resp.body["reason"] != "author required" {
+		t.Fatalf("next request did not observe VDU: %+v", resp)
+	}
+}
+
+func TestBulkDocsVDUOldWinnerSnapshot(t *testing.T) {
+	s := testServer(t, testHTTPStore(t))
+	admin := adminAuth()
+	const db = "vvdu_bulk_old_snapshot"
+	send(t, s, "DELETE", "/"+db, nil, testAdminAuth, admin)
+	if resp := send(t, s, "PUT", "/"+db, nil, testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("create database: %+v", resp)
+	}
+	t.Cleanup(func() { send(t, s, "DELETE", "/"+db, nil, testAdminAuth, admin) })
+
+	vdu := map[string]any{
+		"validate_doc_update": "function(newDoc, oldDoc){ if (newDoc._id.indexOf('_design/') === 0 || !oldDoc) return; if (newDoc.n !== oldDoc.n + 1) throw({forbidden: 'increment once'}); }",
+	}
+	if resp := send(t, s, "PUT", "/"+db+"/_design/rules", vdu,
+		testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("install VDU: %+v", resp)
+	}
+	created := send(t, s, "PUT", "/"+db+"/counter",
+		map[string]any{"n": 0}, testAdminAuth, admin)
+	if created.status != 201 {
+		t.Fatalf("create counter: %+v", created)
+	}
+	rev := created.body["rev"].(string)
+
+	resp := send(t, s, "POST", "/"+db+"/_bulk_docs", map[string]any{
+		"docs": []any{
+			map[string]any{"_id": "counter", "_rev": rev, "n": 1},
+			map[string]any{"_id": "counter", "_rev": rev, "n": 2},
+		},
+	}, testAdminAuth, admin)
+	if resp.status != 201 || len(resp.array) != 2 {
+		t.Fatalf("duplicate-id bulk response: %+v", resp)
+	}
+	if row := resp.array[0].(map[string]any); row["ok"] != true {
+		t.Fatalf("first update: %+v", row)
+	}
+	if row := resp.array[1].(map[string]any); row["error"] != "forbidden" ||
+		row["reason"] != "increment once" {
+		t.Fatalf("second update did not use old snapshot: %+v", row)
+	}
+	got := send(t, s, "GET", "/"+db+"/counter", nil, testAdminAuth, admin)
+	if got.status != 200 || got.body["n"] != float64(1) {
+		t.Fatalf("stored counter: %+v", got)
+	}
+}
+
 func TestChangesJSFilter(t *testing.T) {
 	h := testHandler(t)
 	admin := adminAuth()

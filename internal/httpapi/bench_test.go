@@ -11,10 +11,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"sync/atomic"
 	"testing"
 
+	"github.com/couchgres/couchgres/internal/couch"
 	"github.com/couchgres/couchgres/internal/store"
 )
 
@@ -82,6 +84,128 @@ func benchDocs(b *testing.B, h http.Handler, db string, n int) {
 			b.Fatalf("bulk seed: %+v", resp)
 		}
 	}
+}
+
+// BenchmarkBulkDocsVDUSnapshot tracks the VDU-heavy bulk path from HTTP JSON
+// encoding through its set-based write. Each 500-document request should use
+// one design probe, one old-winner batch, and one security read.
+func BenchmarkBulkDocsVDUSnapshot(b *testing.B) {
+	s := testServer(b, testHTTPStore(b))
+	const db = "bench_bulk_vdu_snapshot"
+	_ = s.store.DeleteDatabase(b.Context(), db)
+	if err := s.store.CreateDatabase(b.Context(), db, false); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = s.store.DeleteDatabase(context.Background(), db) })
+	ddoc := map[string]any{
+		"validate_doc_update": "function(newDoc){ if (!newDoc.valid) throw({forbidden: 'invalid'}); }",
+	}
+	if resp := send(b, s, "PUT", "/"+db+"/_design/rules", ddoc,
+		testAdminAuth, adminAuth()); resp.status != 201 {
+		b.Fatalf("install VDU: %+v", resp)
+	}
+
+	const batchSize = 500
+	before := s.vdu.stats()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		docs := make([]any, batchSize)
+		for i := range docs {
+			docs[i] = map[string]any{
+				"_id":   fmt.Sprintf("doc-%08d", iteration*batchSize+i),
+				"valid": true,
+				"value": i,
+			}
+		}
+		resp := send(b, s, "POST", "/"+db+"/_bulk_docs",
+			map[string]any{"docs": docs}, testAdminAuth, adminAuth())
+		if resp.status != 201 || len(resp.array) != batchSize {
+			b.Fatalf("bulk response: status=%d rows=%d", resp.status, len(resp.array))
+		}
+	}
+	b.StopTimer()
+	after := s.vdu.stats()
+	b.ReportMetric(float64(batchSize*b.N)/b.Elapsed().Seconds(), "docs/sec")
+	b.ReportMetric(float64(after.DesignProbes-before.DesignProbes)/float64(b.N),
+		"design_probes/op")
+	b.ReportMetric(float64(after.OldDocBatches-before.OldDocBatches)/float64(b.N),
+		"old_winner_batches/op")
+	b.ReportMetric(float64(after.SecurityReads-before.SecurityReads)/float64(b.N),
+		"security_reads/op")
+}
+
+// BenchmarkVDUValidationBatching isolates the PERF2-05 change from storage.
+// individual_validation models the old bulk loop; batched_snapshot models the
+// request-level snapshot while invoking the same JavaScript for every doc.
+func BenchmarkVDUValidationBatching(b *testing.B) {
+	s := testServer(b, testHTTPStore(b))
+	const dbName = "bench_vdu_validation_batching"
+	_ = s.store.DeleteDatabase(b.Context(), dbName)
+	if err := s.store.CreateDatabase(b.Context(), dbName, false); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = s.store.DeleteDatabase(context.Background(), dbName) })
+	ddoc := map[string]any{
+		"validate_doc_update": "function(newDoc){ if (!newDoc.valid) throw({forbidden: 'invalid'}); }",
+	}
+	if resp := send(b, s, "PUT", "/"+dbName+"/_design/rules", ddoc,
+		testAdminAuth, adminAuth()); resp.status != 201 {
+		b.Fatalf("install VDU: %+v", resp)
+	}
+	db, err := s.store.GetDB(b.Context(), dbName)
+	if err != nil {
+		b.Fatal(err)
+	}
+	const batchSize = 500
+	ids := make([]string, batchSize)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("doc-%03d", i)
+	}
+	body := map[string]any{"valid": true, "value": 1}
+	req := httptest.NewRequest(http.MethodPost, "/"+dbName+"/_bulk_docs", nil)
+	req = req.WithContext(context.WithValue(b.Context(), userCtxKey{}, &couch.UserCtx{
+		Name: "admin", Roles: []string{"_admin"}, Authenticated: "default",
+	}))
+	// Warm the design-function cache so both cases measure the steady state.
+	if _, err := s.newVDURequestSnapshot(req, db, ids, nil, false); err != nil {
+		b.Fatal(err)
+	}
+
+	run := func(b *testing.B, batched bool) {
+		before := s.vdu.stats()
+		b.ResetTimer()
+		for range b.N {
+			if batched {
+				snapshot, err := s.newVDURequestSnapshot(req, db, ids, nil, false)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for _, id := range ids {
+					if err := s.validateDocUpdateWithSnapshot(
+						req.Context(), snapshot, id, body, nil, false, nil); err != nil {
+						b.Fatal(err)
+					}
+				}
+				continue
+			}
+			for _, id := range ids {
+				if err := s.validateDocUpdate(req, db, id, body, nil, false, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+		b.StopTimer()
+		after := s.vdu.stats()
+		b.ReportMetric(float64(batchSize*b.N)/b.Elapsed().Seconds(), "docs/sec")
+		b.ReportMetric(float64(after.DesignProbes-before.DesignProbes)/float64(b.N),
+			"design_probes/op")
+		b.ReportMetric(float64(after.OldDocBatches-before.OldDocBatches)/float64(b.N),
+			"old_winner_batches/op")
+		b.ReportMetric(float64(after.SecurityReads-before.SecurityReads)/float64(b.N),
+			"security_reads/op")
+	}
+	b.Run("individual_validation", func(b *testing.B) { run(b, false) })
+	b.Run("batched_snapshot", func(b *testing.B) { run(b, true) })
 }
 
 // BenchmarkPartitionPutAtScale measures the partition-limit path with enough

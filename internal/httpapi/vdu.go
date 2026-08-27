@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/couchgres/couchgres/internal/couch"
 	"github.com/couchgres/couchgres/internal/jsengine"
@@ -23,11 +24,15 @@ type vduFn struct {
 	ddoc   json.RawMessage // the full ddoc: require() tree and `this`
 }
 
-// vduCache holds each database's validate functions, invalidated by
-// watching the highest design-doc seq (one indexed count query per write).
+// vduCache holds each database's validate functions, invalidated by watching
+// the highest design-doc seq (one indexed query per single write or bulk
+// request).
 type vduCache struct {
-	mu      sync.Mutex
-	entries map[string]vduCacheEntry
+	mu            sync.Mutex
+	entries       map[string]vduCacheEntry
+	designProbes  atomic.Uint64
+	oldDocBatches atomic.Uint64
+	securityReads atomic.Uint64
 }
 
 type vduCacheEntry struct {
@@ -39,9 +44,24 @@ func newVDUCache() *vduCache {
 	return &vduCache{entries: make(map[string]vduCacheEntry)}
 }
 
+type vduCacheStats struct {
+	DesignProbes  uint64
+	OldDocBatches uint64
+	SecurityReads uint64
+}
+
+func (c *vduCache) stats() vduCacheStats {
+	return vduCacheStats{
+		DesignProbes:  c.designProbes.Load(),
+		OldDocBatches: c.oldDocBatches.Load(),
+		SecurityReads: c.securityReads.Load(),
+	}
+}
+
 // vduFns returns the database's validate_doc_update functions in design-doc
 // id order.
 func (s *Server) vduFns(ctx context.Context, db *store.DB) ([]vduFn, error) {
+	s.vdu.designProbes.Add(1)
 	designSeq, err := s.store.MaxDesignSeq(ctx, db)
 	if err != nil {
 		return nil, err
@@ -79,6 +99,72 @@ func (s *Server) vduFns(ctx context.Context, db *store.DB) ([]vduFn, error) {
 	return fns, nil
 }
 
+// vduRequestSnapshot is the immutable validation state for one HTTP request.
+// Bulk writes share it across every document, reducing VDU discovery, old
+// winner loading, and security loading to at most one database call each.
+type vduRequestSnapshot struct {
+	fns     []vduFn
+	oldDocs map[string]*store.DocRow
+	oldRaw  map[string]json.RawMessage
+	userRaw json.RawMessage
+	secRaw  json.RawMessage
+}
+
+func (s *Server) newVDURequestSnapshot(
+	r *http.Request,
+	db *store.DB,
+	docIDs []string,
+	security map[string]any,
+	fetchOldDocs bool,
+) (*vduRequestSnapshot, error) {
+	fns, err := s.vduFns(r.Context(), db)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := &vduRequestSnapshot{fns: fns}
+	if (len(fns) > 0 || fetchOldDocs) && len(docIDs) > 0 {
+		s.vdu.oldDocBatches.Add(1)
+		snapshot.oldDocs, err = s.store.GetDocsAny(r.Context(), db, docIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(fns) == 0 {
+		return snapshot, nil
+	}
+
+	snapshot.oldRaw = make(map[string]json.RawMessage, len(snapshot.oldDocs))
+	for id, old := range snapshot.oldDocs {
+		if old.Deleted {
+			continue
+		}
+		raw, err := json.Marshal(old.JSON())
+		if err != nil {
+			return nil, err
+		}
+		snapshot.oldRaw[id] = raw
+	}
+	user := userOf(r)
+	snapshot.userRaw, err = json.Marshal(map[string]any{
+		"db": db.Name, "name": user.NameJSON(), "roles": user.RolesJSON(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if security == nil {
+		s.vdu.securityReads.Add(1)
+		security, err = s.store.GetSecurity(r.Context(), db)
+		if err != nil {
+			return nil, err
+		}
+	}
+	snapshot.secRaw, err = json.Marshal(security)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
 // validateDocUpdate runs every validate_doc_update function against the
 // incoming write. newBody is the document body (underscore members split
 // off), rev the rev the client supplied.
@@ -91,11 +177,25 @@ func (s *Server) validateDocUpdate(
 	deleted bool,
 	attachments map[string]any,
 ) error {
-	fns, err := s.vduFns(r.Context(), db)
+	snapshot, err := s.newVDURequestSnapshot(
+		r, db, []string{docid}, nil, false)
 	if err != nil {
 		return err
 	}
-	if len(fns) == 0 {
+	return s.validateDocUpdateWithSnapshot(
+		r.Context(), snapshot, docid, newBody, rev, deleted, attachments)
+}
+
+func (s *Server) validateDocUpdateWithSnapshot(
+	ctx context.Context,
+	snapshot *vduRequestSnapshot,
+	docid string,
+	newBody map[string]any,
+	rev *couch.Rev,
+	deleted bool,
+	attachments map[string]any,
+) error {
+	if snapshot == nil || len(snapshot.fns) == 0 {
 		return nil
 	}
 
@@ -118,39 +218,9 @@ func (s *Server) validateDocUpdate(
 		return err
 	}
 
-	var oldRaw json.RawMessage
-	if old, err := s.store.GetDocAny(r.Context(), db, docid); err == nil && !old.Deleted {
-		if oldRaw, err = json.Marshal(old.JSON()); err != nil {
-			return err
-		}
-	}
-
-	user := userOf(r)
-	var name any
-	if !user.IsAnonymous() {
-		name = user.Name
-	}
-	roles := user.Roles
-	if roles == nil {
-		roles = []string{}
-	}
-	userRaw, err := json.Marshal(map[string]any{
-		"db": db.Name, "name": name, "roles": roles,
-	})
-	if err != nil {
-		return err
-	}
-	secMap, err := s.store.GetSecurity(r.Context(), db)
-	if err != nil {
-		return err
-	}
-	secRaw, err := json.Marshal(secMap)
-	if err != nil {
-		return err
-	}
-
-	for _, fn := range fns {
-		err := s.js.Validate(r.Context(), fn.sig, fn.src, newRaw, oldRaw, userRaw, secRaw, fn.ddoc)
+	for _, fn := range snapshot.fns {
+		err := s.js.Validate(ctx, fn.sig, fn.src, newRaw, snapshot.oldRaw[docid],
+			snapshot.userRaw, snapshot.secRaw, fn.ddoc)
 		if err == nil {
 			continue
 		}

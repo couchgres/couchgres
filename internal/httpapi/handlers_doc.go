@@ -90,6 +90,18 @@ func (s *Server) authorizeDocWrite(r *http.Request, db *store.DB, docid string) 
 	if err != nil {
 		return err
 	}
+	return authorizeDocWriteWithSecurity(user, security, db, docid)
+}
+
+func authorizeDocWriteWithSecurity(
+	user *couch.UserCtx,
+	security *couch.SecurityObj,
+	db *store.DB,
+	docid string,
+) error {
+	if user.IsServerAdmin() {
+		return nil
+	}
 	if strings.HasPrefix(docid, "_design/") {
 		if !security.IsDBAdmin(user) {
 			return couch.DBAdminRequired(user)
@@ -127,6 +139,21 @@ func (s *Server) prepareUsersWrite(
 	var old map[string]any
 	if row, err := s.store.GetDocAny(r.Context(), db, docid); err == nil && !row.Deleted {
 		old = row.Body
+	}
+	return s.prepareUsersWriteWithOld(r, db, docid, body, deleting, old)
+}
+
+func (s *Server) prepareUsersWriteWithOld(
+	r *http.Request,
+	db *store.DB,
+	docid string,
+	body map[string]any,
+	deleting bool,
+	old map[string]any,
+) error {
+	if db.Name != "_users" ||
+		strings.HasPrefix(docid, "_design/") || strings.HasPrefix(docid, "_local/") {
+		return nil
 	}
 	minIterations, maxIterations := s.config.passwordIterationBounds()
 	if err := couch.ValidateUserDoc(docid, body, old, deleting, userOf(r),

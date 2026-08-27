@@ -9,6 +9,18 @@ import (
 	"github.com/couchgres/couchgres/internal/store"
 )
 
+// bulkDocWrite carries one parsed document through request validation, VDU
+// validation, revision preparation, and storage. Keeping it avoids parsing the
+// same JSON object once for ID validation and again for the write.
+type bulkDocWrite struct {
+	doc  *couch.IncomingDoc
+	id   string
+	raw  []byte
+	atts []store.AttachmentWrite
+	path []couch.Rev
+	err  error
+}
+
 // bulkDocs is POST /{db}/_bulk_docs: many writes, one response array,
 // non-transactional across documents (CouchDB's contract).
 func (s *Server) bulkDocs(w http.ResponseWriter, r *http.Request) error {
@@ -68,18 +80,119 @@ func (s *Server) bulkDocs(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// Malformed ids fail the whole batch (per-doc errors are for write
-	// outcomes, not invalid requests).
-	for _, raw := range docsRaw {
-		doc, err := couch.ParseDoc(raw)
-		if err != nil {
-			continue // reported per-doc below
+	// Parse once, assign generated IDs once, and retain the raw bytes used by
+	// CouchDB's revision hash. Malformed explicit IDs still fail the whole
+	// batch; parse failures remain per-document outcomes.
+	prepared := make([]bulkDocWrite, len(docsRaw))
+	normalIDs := make([]string, 0, len(docsRaw))
+	seenNormalIDs := make(map[string]bool, len(docsRaw))
+	hasParsedWrite := false
+	for i, raw := range docsRaw {
+		doc, parseErr := couch.ParseDoc(raw)
+		prepared[i] = bulkDocWrite{doc: doc, raw: rawDocAt(i), err: parseErr}
+		if parseErr != nil {
+			continue
 		}
 		if doc.ID != "" {
 			if err := s.validateDocIDForDB(db, doc.ID); err != nil {
 				return err
 			}
 		}
+		prepared[i].id = doc.ID
+		if prepared[i].id == "" && newEdits {
+			prepared[i].id = randomUUID()
+		}
+		if prepared[i].id == "" {
+			prepared[i].err = couch.BadRequest("new_edits=false requires _id")
+			continue
+		}
+		hasParsedWrite = true
+		if !strings.HasPrefix(prepared[i].id, "_local/") &&
+			!seenNormalIDs[prepared[i].id] {
+			seenNormalIDs[prepared[i].id] = true
+			normalIDs = append(normalIDs, prepared[i].id)
+		}
+	}
+
+	// One security read authorizes the whole batch for non-server-admins. The
+	// same immutable object is passed to every VDU.
+	user := userOf(r)
+	var securityMap map[string]any
+	var securityObj *couch.SecurityObj
+	var securityErr error
+	if hasParsedWrite && !user.IsServerAdmin() {
+		s.vdu.securityReads.Add(1)
+		securityMap, securityErr = s.store.GetSecurity(r.Context(), db)
+		if securityErr == nil {
+			securityObj = couch.ParseSecurity(securityMap)
+		}
+	}
+
+	// VDU discovery and all database-backed validation inputs are immutable for
+	// this request. _users also reuses the winner batch for its built-in rules.
+	var vduSnapshot *vduRequestSnapshot
+	var vduSnapshotErr error
+	if len(normalIDs) > 0 && securityErr == nil {
+		vduSnapshot, vduSnapshotErr = s.newVDURequestSnapshot(
+			r, db, normalIDs, securityMap, db.Name == "_users")
+	}
+
+	// Complete all fallible prevalidation before applying any local,
+	// replicated, or ordinary write.
+	for i := range prepared {
+		item := &prepared[i]
+		if item.err != nil {
+			continue
+		}
+		if securityErr != nil {
+			item.err = securityErr
+			continue
+		}
+		if !user.IsServerAdmin() {
+			item.err = authorizeDocWriteWithSecurity(user, securityObj, db, item.id)
+			if item.err != nil {
+				continue
+			}
+		}
+		if strings.HasPrefix(item.id, "_local/") {
+			continue
+		}
+		if vduSnapshotErr != nil {
+			item.err = vduSnapshotErr
+			continue
+		}
+		var oldBody map[string]any
+		if vduSnapshot != nil {
+			if old := vduSnapshot.oldDocs[item.id]; old != nil && !old.Deleted {
+				oldBody = old.Body
+			}
+		}
+		item.err = s.prepareUsersWriteWithOld(
+			r, db, item.id, item.doc.Body, item.doc.Deleted, oldBody)
+		if item.err != nil {
+			continue
+		}
+		if db.Name == "_users" && !strings.HasPrefix(item.id, "_design/") {
+			item.raw = nil // the server rewrote the body (password hashing)
+		}
+		item.atts, item.err = attachmentWrites(item.doc.Attachments)
+		if item.err != nil {
+			continue
+		}
+		item.atts = orderAttachmentWrites(item.atts, item.raw)
+		s.compressAttachmentWrites(item.atts)
+
+		validationRev := item.doc.Rev
+		if !newEdits {
+			item.path = item.doc.RevPath()
+			if len(item.path) == 0 {
+				item.err = couch.BadRequest("new_edits=false requires a _rev or _revisions")
+				continue
+			}
+			validationRev = &item.path[0]
+		}
+		item.err = s.validateDocUpdateWithSnapshot(r.Context(), vduSnapshot,
+			item.id, item.doc.Body, validationRev, item.doc.Deleted, item.doc.Attachments)
 	}
 
 	results := make([]any, 0, len(docsRaw))
@@ -92,95 +205,43 @@ func (s *Server) bulkDocs(w http.ResponseWriter, r *http.Request) error {
 			"id": id, "error": ce.Err, "reason": ce.Reason,
 		})
 	}
-
-	// new_edits=true writes are deferred into one set-based store call. The
-	// per-doc transaction loop made bulk ingest slow. Their result
-	// slots are filled afterwards.
 	var bulkWrites []store.BulkWrite
 	var bulkSlots []int
-
-	for docIdx, raw := range docsRaw {
-		doc, err := couch.ParseDoc(raw)
-		if err != nil {
-			report("", err)
+	for i := range prepared {
+		item := &prepared[i]
+		if item.err != nil {
+			report(item.id, item.err)
 			continue
 		}
-		rawDoc := rawDocAt(docIdx)
-		docid := doc.ID
-		if docid == "" && newEdits {
-			docid = randomUUID()
-		}
-		if docid == "" {
-			report("", couch.BadRequest("new_edits=false requires _id"))
-			continue
-		}
-		if err := s.validateDocIDForDB(db, docid); err != nil {
-			report(docid, err)
-			continue
-		}
-		if err := s.authorizeDocWrite(r, db, docid); err != nil {
-			report(docid, err)
-			continue
-		}
-		// _local docs ride through _bulk_docs into the local store
-		// The write is unversioned and always wins.
-		if strings.HasPrefix(docid, "_local/") {
-			content := make(map[string]any, len(doc.Body))
-			for k, v := range doc.Body {
+		if strings.HasPrefix(item.id, "_local/") {
+			content := make(map[string]any, len(item.doc.Body))
+			for k, v := range item.doc.Body {
 				content[k] = v
 			}
-			local, err := s.store.PutLocalDoc(r.Context(), db, docid, content)
+			local, err := s.store.PutLocalDoc(r.Context(), db, item.id, content)
 			if err != nil {
-				report(docid, err)
+				report(item.id, err)
 				continue
 			}
 			if newEdits {
 				results = append(results, map[string]any{
-					"ok": true, "id": docid, "rev": local.Rev(),
+					"ok": true, "id": item.id, "rev": local.Rev(),
 				})
 			}
 			continue
 		}
-		if err := s.prepareUsersWrite(r, db, docid, doc.Body, doc.Deleted); err != nil {
-			report(docid, err)
-			continue
-		}
-		if db.Name == "_users" && !strings.HasPrefix(docid, "_design/") {
-			rawDoc = nil // the server rewrote the body (password hashing)
-		}
-		atts, err := attachmentWrites(doc.Attachments)
-		if err != nil {
-			report(docid, err)
-			continue
-		}
-		atts = orderAttachmentWrites(atts, rawDoc)
-		s.compressAttachmentWrites(atts)
-
 		if newEdits {
-			if err := s.validateDocUpdate(r, db, docid, doc.Body, doc.Rev, doc.Deleted, doc.Attachments); err != nil {
-				report(docid, err)
-				continue
-			}
 			bulkWrites = append(bulkWrites, store.BulkWrite{
-				ID: docid, Body: doc.Body, RawBody: rawDoc,
-				Expected: doc.Rev, Deleted: doc.Deleted, Atts: atts,
+				ID: item.id, Body: item.doc.Body, RawBody: item.raw,
+				Expected: item.doc.Rev, Deleted: item.doc.Deleted, Atts: item.atts,
 			})
 			bulkSlots = append(bulkSlots, len(results))
-			results = append(results, nil) // filled from the batch outcome
+			results = append(results, nil)
 			continue
 		}
-
-		path := doc.RevPath()
-		if len(path) == 0 {
-			report(docid, couch.BadRequest("new_edits=false requires a _rev or _revisions"))
-			continue
-		}
-		if err := s.validateDocUpdate(r, db, docid, doc.Body, &path[0], doc.Deleted, doc.Attachments); err != nil {
-			report(docid, err)
-			continue
-		}
-		if err := s.store.ForceRev(r.Context(), db, docid, doc.Body, path, doc.Deleted, atts); err != nil {
-			report(docid, err)
+		if err := s.store.ForceRev(r.Context(), db, item.id, item.doc.Body,
+			item.path, item.doc.Deleted, item.atts); err != nil {
+			report(item.id, err)
 		}
 		// CouchDB reports nothing for successful new_edits=false writes.
 	}
