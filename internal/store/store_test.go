@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -287,6 +289,174 @@ func TestDocCRUDAndRevChain(t *testing.T) {
 	}
 }
 
+func TestDocumentCountsTrackEveryWinnerTransition(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_doc_counts")
+	assertDocumentCounts(t, s, db, 0, 0)
+
+	rev, _, err := s.PutDoc(ctx, db, "interactive", body(t, `{"v":1}`), nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 1, 0)
+
+	rev, _, err = s.PutDoc(ctx, db, "interactive", body(t, `{"v":2}`), nil, &rev, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 1, 0)
+
+	rev, _, err = s.PutDoc(ctx, db, "interactive", map[string]any{}, nil, &rev, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 0, 1)
+
+	if _, _, err = s.PutDoc(ctx, db, "interactive", body(t, `{"back":true}`), nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 1, 0)
+
+	results, err := s.BulkPutDocs(ctx, db, []BulkWrite{
+		{ID: "bulk-live", Body: body(t, `{"live":true}`)},
+		{ID: "bulk-deleted", Body: map[string]any{}, Deleted: true},
+	})
+	if err != nil || results[0].Err != nil || results[1].Err != nil {
+		t.Fatalf("bulk write: %+v, %v", results, err)
+	}
+	assertDocumentCounts(t, s, db, 2, 1)
+
+	deletedRev := couch.Rev{Num: 1, Hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	if err := s.ForceRev(ctx, db, "replicated", map[string]any{},
+		[]couch.Rev{deletedRev}, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 2, 2)
+
+	liveRev := couch.Rev{Num: 2, Hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	if err := s.ForceRev(ctx, db, "replicated", body(t, `{"live":true}`),
+		[]couch.Rev{liveRev, deletedRev}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 3, 1)
+
+	live, err := s.GetDocAny(ctx, db, "bulk-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Purge(ctx, db, map[string][]couch.Rev{"bulk-live": {live.Rev}}); err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 2, 1)
+
+	deleted, err := s.GetDocAny(ctx, db, "bulk-deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Purge(ctx, db, map[string][]couch.Rev{"bulk-deleted": {deleted.Rev}}); err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 2, 0)
+}
+
+func TestBootstrapBackfillsDocumentCountsOnce(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_doc_count_migration")
+
+	if _, _, err := s.PutDoc(ctx, db, "live", body(t, `{"v":1}`), nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	rev, _, err := s.PutDoc(ctx, db, "deleted", map[string]any{}, nil, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.PutDoc(ctx, db, "deleted", map[string]any{}, nil, &rev, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, fmt.Sprintf(
+		`DROP TRIGGER docs_count_insert ON %[1]s.docs;
+		 DROP TRIGGER docs_count_update ON %[1]s.docs;
+		 DROP TRIGGER docs_count_delete ON %[1]s.docs`, db.Schema)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE couchgres.databases
+		 SET doc_count = 0, doc_del_count = 0, doc_counts_initialized = false
+		 WHERE name = $1`, db.Name); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 1, 1)
+	if _, _, err := s.PutDoc(ctx, db, "after-migration", body(t, `{"v":1}`), nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertDocumentCounts(t, s, db, 2, 1)
+}
+
+func TestDocumentCountsRemainExactUnderConcurrentCreation(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_doc_count_race")
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for i := range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			_, _, err := s.PutDoc(ctx, db, "same-id",
+				map[string]any{"writer": json.Number(strconv.Itoa(i))}, nil, nil, false, nil)
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	succeeded := 0
+	for range 2 {
+		err := <-errs
+		if err == nil {
+			succeeded++
+			continue
+		}
+		if ce, ok := err.(*couch.Error); !ok || ce.Err != "conflict" {
+			t.Fatalf("concurrent create: %v", err)
+		}
+	}
+	if succeeded == 0 {
+		t.Fatal("both concurrent creates failed")
+	}
+	assertDocumentCounts(t, s, db, 1, 0)
+}
+
+func assertDocumentCounts(t *testing.T, s *Store, db *DB, wantLive, wantDeleted int64) {
+	t.Helper()
+	info, err := s.DBInfo(t.Context(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.DocCount != wantLive || info.DocDelCount != wantDeleted {
+		t.Fatalf("metadata counts = (%d, %d), want (%d, %d)",
+			info.DocCount, info.DocDelCount, wantLive, wantDeleted)
+	}
+	var actualLive, actualDeleted int64
+	if err := s.pool.QueryRow(t.Context(), fmt.Sprintf(
+		`SELECT count(*) FILTER (WHERE NOT deleted),
+		        count(*) FILTER (WHERE deleted) FROM %s.docs`, db.Schema),
+	).Scan(&actualLive, &actualDeleted); err != nil {
+		t.Fatal(err)
+	}
+	if actualLive != info.DocCount || actualDeleted != info.DocDelCount {
+		t.Fatalf("metadata counts = (%d, %d), table counts = (%d, %d)",
+			info.DocCount, info.DocDelCount, actualLive, actualDeleted)
+	}
+}
+
 func TestRevsLimitPrunesHistory(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
@@ -363,13 +533,16 @@ func TestAllDocsRangesAndKeys(t *testing.T) {
 
 	two := int64(2)
 	page, err = s.AllDocs(ctx, db, &AllDocsParams{
-		Descending: true, Limit: &two, Skip: 1,
+		Descending: true, Limit: &two, Skip: 1, IncludeDocs: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ids := rowIDs(page); !slices.Equal(ids, []string{"delta", "beta"}) {
 		t.Fatalf("descending: %v", ids)
+	}
+	if page.Rows[0].Body == nil || page.Rows[1].Body == nil {
+		t.Fatalf("seek pagination lost included docs: %+v", page.Rows)
 	}
 
 	page, err = s.AllDocsKeys(ctx, db,
@@ -395,6 +568,9 @@ func TestAllDocsRangesAndKeys(t *testing.T) {
 	}
 	if page.Offset != nil {
 		t.Fatal("keys mode must not report offset")
+	}
+	if page.TotalRows != 4 {
+		t.Fatalf("keys total_rows: %d", page.TotalRows)
 	}
 }
 

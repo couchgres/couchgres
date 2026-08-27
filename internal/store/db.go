@@ -56,8 +56,9 @@ func (s *Store) CreateDatabase(ctx context.Context, name string, partitioned boo
 
 	tag, err := tx.Exec(ctx,
 		`INSERT INTO couchgres.databases
-		   (name, schema_name, partitioned, instance_start_time)
-		 VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING`,
+		   (name, schema_name, partitioned, instance_start_time,
+		    doc_counts_initialized)
+		 VALUES ($1, $2, $3, $4, true) ON CONFLICT (name) DO NOTHING`,
 		name, schema, partitioned, startTime,
 	)
 	if err != nil {
@@ -180,12 +181,13 @@ func (s *Store) DBInfo(ctx context.Context, db *DB) (*Info, error) {
 	info := &Info{}
 	err := s.pool.QueryRow(ctx, fmt.Sprintf(
 		`SELECT
-		   (SELECT count(*) FROM %[1]s.docs WHERE NOT deleted),
-		   (SELECT count(*) FROM %[1]s.docs WHERE deleted),
+		   m.doc_count,
+		   m.doc_del_count,
 		   (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM %[1]s.update_seq),
 		   pg_total_relation_size('%[1]s.docs')
 		   + pg_total_relation_size('%[1]s.revs')
-		   + pg_total_relation_size('%[1]s.attachments')`, db.Schema),
+		   + pg_total_relation_size('%[1]s.attachments')
+		 FROM couchgres.databases m WHERE m.name = $1`, db.Schema), db.Name,
 	).Scan(&info.DocCount, &info.DocDelCount, &info.UpdateSeq, &info.SizeBytes)
 	if err != nil {
 		return nil, err

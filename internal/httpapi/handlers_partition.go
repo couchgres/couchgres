@@ -284,6 +284,9 @@ func (s *Server) partitionAllDocsImpl(w http.ResponseWriter, r *http.Request, bo
 		req.params.StartKey = clamp(req.params.StartKey, lo, true)
 		req.params.EndKey = clamp(req.params.EndKey, hi, false)
 	}
+	// The store's default offset is database-relative. Avoid paying for that
+	// count because this endpoint replaces it with a partition-relative value.
+	req.params.OmitOffset = !req.sendKeys
 
 	page, err := s.runAllDocs(r, db, req)
 	if err != nil {
@@ -294,7 +297,7 @@ func (s *Server) partitionAllDocsImpl(w http.ResponseWriter, r *http.Request, bo
 		return err
 	}
 	page.TotalRows = total
-	if page.Offset != nil && !req.sendKeys {
+	if !req.sendKeys {
 		var preceding int64
 		if !req.params.Descending {
 			if preceding, err = s.store.CountDocsRange(r.Context(), db, lo, *req.params.StartKey, false); err != nil {

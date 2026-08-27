@@ -18,7 +18,54 @@ CREATE TABLE IF NOT EXISTS couchgres.databases (
 );
 ALTER TABLE couchgres.databases
     ADD COLUMN IF NOT EXISTS purge_seq bigint NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS purged_infos_limit bigint NOT NULL DEFAULT 1000;
+    ADD COLUMN IF NOT EXISTS purged_infos_limit bigint NOT NULL DEFAULT 1000,
+    ADD COLUMN IF NOT EXISTS doc_count bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS doc_del_count bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS doc_counts_initialized boolean NOT NULL DEFAULT false;
+
+-- Statement-level transition tables make one counter adjustment per write
+-- statement, including a whole _bulk_docs winner refresh. The INSERT and UPDATE
+-- triggers both run for INSERT ... ON CONFLICT DO UPDATE, but each transition
+-- table contains only the rows for its event.
+CREATE OR REPLACE FUNCTION couchgres.update_doc_counts()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $doc_counts$
+DECLARE
+    live_delta bigint := 0;
+    deleted_delta bigint := 0;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        SELECT count(*) FILTER (WHERE NOT deleted),
+               count(*) FILTER (WHERE deleted)
+          INTO live_delta, deleted_delta
+          FROM new_docs;
+    ELSIF TG_OP = 'UPDATE' THEN
+        SELECT
+          (SELECT count(*) FILTER (WHERE NOT deleted) FROM new_docs)
+            - (SELECT count(*) FILTER (WHERE NOT deleted) FROM old_docs),
+          (SELECT count(*) FILTER (WHERE deleted) FROM new_docs)
+            - (SELECT count(*) FILTER (WHERE deleted) FROM old_docs)
+          INTO live_delta, deleted_delta;
+    ELSIF TG_OP = 'DELETE' THEN
+        SELECT -(count(*) FILTER (WHERE NOT deleted)),
+               -(count(*) FILTER (WHERE deleted))
+          INTO live_delta, deleted_delta
+          FROM old_docs;
+    END IF;
+
+    IF live_delta <> 0 OR deleted_delta <> 0 THEN
+        UPDATE couchgres.databases
+           SET doc_count = doc_count + live_delta,
+               doc_del_count = doc_del_count + deleted_delta
+         WHERE schema_name = TG_TABLE_SCHEMA;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'database metadata missing for schema %', TG_TABLE_SCHEMA;
+        END IF;
+    END IF;
+    RETURN NULL;
+END
+$doc_counts$;
 
 CREATE TABLE IF NOT EXISTS couchgres.server_config (
     section text NOT NULL,
@@ -117,5 +164,27 @@ CREATE SEQUENCE {s}.update_seq;
 `
 
 func dbDDL(schema string) string {
-	return strings.ReplaceAll(dbDDLTemplate, "{s}", schema)
+	return strings.ReplaceAll(dbDDLTemplate, "{s}", schema) + docCountTriggers(schema)
+}
+
+const docCountTriggersTemplate = `
+DROP TRIGGER IF EXISTS docs_count_insert ON {s}.docs;
+CREATE TRIGGER docs_count_insert
+AFTER INSERT ON {s}.docs
+REFERENCING NEW TABLE AS new_docs
+FOR EACH STATEMENT EXECUTE FUNCTION couchgres.update_doc_counts();
+DROP TRIGGER IF EXISTS docs_count_update ON {s}.docs;
+CREATE TRIGGER docs_count_update
+AFTER UPDATE ON {s}.docs
+REFERENCING OLD TABLE AS old_docs NEW TABLE AS new_docs
+FOR EACH STATEMENT EXECUTE FUNCTION couchgres.update_doc_counts();
+DROP TRIGGER IF EXISTS docs_count_delete ON {s}.docs;
+CREATE TRIGGER docs_count_delete
+AFTER DELETE ON {s}.docs
+REFERENCING OLD TABLE AS old_docs
+FOR EACH STATEMENT EXECUTE FUNCTION couchgres.update_doc_counts();
+`
+
+func docCountTriggers(schema string) string {
+	return strings.ReplaceAll(docCountTriggersTemplate, "{s}", schema)
 }

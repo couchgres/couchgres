@@ -19,6 +19,9 @@ type AllDocsParams struct {
 	IncludeDocs  bool
 	Conflicts    bool // With IncludeDocs, report live non-winner leaves.
 	UpdateSeq    bool
+	// OmitOffset lets partition-scoped callers avoid a database-wide preceding
+	// count when they will calculate the partition-relative offset themselves.
+	OmitOffset bool
 }
 
 type AllDocsRow struct {
@@ -79,9 +82,33 @@ func (s *Store) AllDocs(ctx context.Context, db *DB, p *AllDocsParams) (*AllDocs
 	if p.IncludeDocs {
 		bodySel, join = winnerBody, " "+winnerJoin(db.Schema)
 	}
+	// CouchDB's numeric skip cannot be turned into a pure cursor: PostgreSQL
+	// must still find the Nth matching id. Keep that work on the narrow primary
+	// key index, then seek from the boundary so skipped rows never pay for the
+	// winner-body join or result decoding.
+	prefix := ""
+	offsetSQL := ""
+	if p.Skip > 0 {
+		prefix = fmt.Sprintf(
+			`WITH skip_boundary AS MATERIALIZED (
+			   SELECT d.id FROM %s.docs d WHERE %s
+			   ORDER BY d.id %s OFFSET %d LIMIT 1
+			 ) `,
+			db.Schema, strings.Join(conditions, " AND "), order, p.Skip-1)
+		op := ">"
+		if p.Descending {
+			op = "<"
+		}
+		conditions = append(conditions,
+			fmt.Sprintf("d.id %s (SELECT id FROM skip_boundary)", op))
+	} else if p.Skip < 0 {
+		// Parameter validation normally rejects this. Preserve PostgreSQL's
+		// existing error if an internal caller bypasses that boundary.
+		offsetSQL = fmt.Sprintf("OFFSET %d", p.Skip)
+	}
 	query := fmt.Sprintf(
-		"SELECT d.id, d.rev_num, d.rev_hash, %s FROM %s.docs d%s WHERE %s ORDER BY d.id %s OFFSET %d %s",
-		bodySel, db.Schema, join, strings.Join(conditions, " AND "), order, p.Skip, limit)
+		"%sSELECT d.id, d.rev_num, d.rev_hash, %s FROM %s.docs d%s WHERE %s ORDER BY d.id %s %s %s",
+		prefix, bodySel, db.Schema, join, strings.Join(conditions, " AND "), order, offsetSQL, limit)
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -110,25 +137,28 @@ func (s *Store) AllDocs(ctx context.Context, db *DB, p *AllDocsParams) (*AllDocs
 		}
 	}
 
-	// offset is documents strictly before the iteration start, plus skip.
-	preceding := int64(0)
-	if p.StartKey != nil {
-		op := "<"
-		if p.Descending {
-			op = ">"
+	if !p.OmitOffset {
+		// offset is documents strictly before the iteration start, plus skip.
+		// This range count is required for CouchDB's exact response field.
+		preceding := int64(0)
+		if p.StartKey != nil {
+			op := "<"
+			if p.Descending {
+				op = ">"
+			}
+			if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+				"SELECT count(*) FROM %s.docs WHERE NOT deleted AND id %s $1", db.Schema, op),
+				*p.StartKey,
+			).Scan(&preceding); err != nil {
+				return nil, err
+			}
 		}
-		if err := s.pool.QueryRow(ctx, fmt.Sprintf(
-			"SELECT count(*) FROM %s.docs WHERE NOT deleted AND id %s $1", db.Schema, op),
-			*p.StartKey,
-		).Scan(&preceding); err != nil {
-			return nil, err
-		}
+		offset := preceding + p.Skip
+		page.Offset = &offset
 	}
-	offset := preceding + p.Skip
-	page.Offset = &offset
 
-	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		"SELECT count(*) FROM %s.docs WHERE NOT deleted", db.Schema),
+	if err := s.pool.QueryRow(ctx,
+		"SELECT doc_count FROM couchgres.databases WHERE name = $1", db.Name,
 	).Scan(&page.TotalRows); err != nil {
 		return nil, err
 	}
@@ -190,10 +220,14 @@ func (s *Store) AllDocsKeys(
 	keys []string,
 	includeDocs, conflicts, updateSeq bool,
 ) (*AllDocsPage, error) {
+	bodySel, join := "null::jsonb", ""
+	if includeDocs {
+		bodySel, join = winnerBody, " "+winnerJoin(db.Schema)
+	}
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(
 		`SELECT d.id, d.rev_num, d.rev_hash, d.deleted, %s
 		 FROM %s.docs d %s WHERE d.id = ANY($1)`,
-		winnerBody, db.Schema, winnerJoin(db.Schema)), keys)
+		bodySel, db.Schema, join), keys)
 	if err != nil {
 		return nil, err
 	}
@@ -236,8 +270,8 @@ func (s *Store) AllDocsKeys(
 		}
 	}
 
-	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		"SELECT count(*) FROM %s.docs WHERE NOT deleted", db.Schema),
+	if err := s.pool.QueryRow(ctx,
+		"SELECT doc_count FROM couchgres.databases WHERE name = $1", db.Name,
 	).Scan(&page.TotalRows); err != nil {
 		return nil, err
 	}
