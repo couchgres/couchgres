@@ -522,41 +522,45 @@ func TestDocumentCountsTrackEveryWinnerTransition(t *testing.T) {
 	assertDocumentCounts(t, s, db, 2, 0)
 }
 
-func TestBootstrapBackfillsDocumentCountsOnce(t *testing.T) {
+func TestDatabaseStatsStripesInitialized(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
-	db := freshDB(t, s, "it_doc_count_migration")
+	db := freshDB(t, s, "it_database_stats_stripes")
 
-	if _, _, err := s.PutDoc(ctx, db, "live", body(t, `{"v":1}`), nil, nil, false, nil); err != nil {
+	var stripes int
+	var minStripe, maxStripe int
+	var live, deleted, external int64
+	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		`SELECT count(*), min(stripe), max(stripe), sum(doc_count),
+		        sum(doc_del_count), sum(external_size)
+		 FROM %s.database_stats`, db.Schema),
+	).Scan(&stripes, &minStripe, &maxStripe, &live, &deleted, &external); err != nil {
 		t.Fatal(err)
 	}
-	rev, _, err := s.PutDoc(ctx, db, "deleted", map[string]any{}, nil, nil, false, nil)
-	if err != nil {
-		t.Fatal(err)
+	if stripes != databaseStatStripes || minStripe != 0 || maxStripe != databaseStatStripes-1 {
+		t.Fatalf("database stat stripes = %d [%d,%d], want %d [0,%d]",
+			stripes, minStripe, maxStripe, databaseStatStripes, databaseStatStripes-1)
 	}
-	if _, _, err := s.PutDoc(ctx, db, "deleted", map[string]any{}, nil, &rev, true, nil); err != nil {
+	if live != 0 || deleted != 0 || external != 0 {
+		t.Fatalf("initial database stats = (%d, %d, %d), want zeros",
+			live, deleted, external)
+	}
+}
+
+func TestDocumentIDCannotMoveBetweenDatabaseStatsStripes(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_database_stats_immutable_id")
+	if _, _, err := s.PutDoc(ctx, db, "original",
+		body(t, `{"value":1}`), nil, nil, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.pool.Exec(ctx, fmt.Sprintf(
-		`DROP TRIGGER docs_count_insert ON %[1]s.docs;
-		 DROP TRIGGER docs_count_update ON %[1]s.docs;
-		 DROP TRIGGER docs_count_delete ON %[1]s.docs`, db.Schema)); err != nil {
-		t.Fatal(err)
+		"UPDATE %s.docs SET id = 'moved' WHERE id = 'original'", db.Schema,
+	)); err == nil {
+		t.Fatal("docs primary key update succeeded")
 	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE couchgres.databases
-		 SET doc_count = 0, doc_del_count = 0, doc_counts_initialized = false
-		 WHERE name = $1`, db.Name); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Bootstrap(ctx); err != nil {
-		t.Fatal(err)
-	}
-	assertDocumentCounts(t, s, db, 1, 1)
-	if _, _, err := s.PutDoc(ctx, db, "after-migration", body(t, `{"v":1}`), nil, nil, false, nil); err != nil {
-		t.Fatal(err)
-	}
-	assertDocumentCounts(t, s, db, 2, 1)
+	assertDocumentCounts(t, s, db, 1, 0)
 }
 
 func TestDocumentCountsRemainExactUnderConcurrentCreation(t *testing.T) {
@@ -778,6 +782,184 @@ func TestConcurrentAbsentAttachmentWritesClaimOnce(t *testing.T) {
 	assertDocumentCounts(t, s, db, 1, 0)
 }
 
+func TestDatabaseStatsRemainExactUnderConcurrentMutations(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_database_stats_race")
+
+	const workers = 8
+	const docsPerWorker = 32
+	run := func(mutate func(worker, offset, n int) error) {
+		t.Helper()
+		start := make(chan struct{})
+		errs := make(chan error, workers)
+		var ready sync.WaitGroup
+		var done sync.WaitGroup
+		ready.Add(workers)
+		done.Add(workers)
+		for worker := range workers {
+			go func() {
+				defer done.Done()
+				ready.Done()
+				<-start
+				for offset := range docsPerWorker {
+					n := worker*docsPerWorker + offset
+					if err := mutate(worker, offset, n); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}()
+		}
+		ready.Wait()
+		close(start)
+		done.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatal(err)
+		}
+	}
+
+	run(func(_, _, n int) error {
+		_, err := s.pool.Exec(ctx, fmt.Sprintf(
+			`INSERT INTO %s.docs
+			   (id, rev_num, rev_hash, deleted, seq, external_size)
+			 VALUES ($1, 1, 'concurrent', false, $2, $3)`, db.Schema),
+			fmt.Sprintf("doc-%04d", n), n+1, n%97+1)
+		return err
+	})
+	run(func(_, _, n int) error {
+		deleted := n%3 == 0
+		externalSize := n%193 + 1
+		if deleted {
+			externalSize = 0
+		}
+		_, err := s.pool.Exec(ctx, fmt.Sprintf(
+			`UPDATE %s.docs SET deleted = $2, external_size = $3
+			 WHERE id = $1`, db.Schema),
+			fmt.Sprintf("doc-%04d", n), deleted, externalSize)
+		return err
+	})
+	run(func(_, _, n int) error {
+		if n%5 != 0 {
+			return nil
+		}
+		_, err := s.pool.Exec(ctx, fmt.Sprintf(
+			"DELETE FROM %s.docs WHERE id = $1", db.Schema),
+			fmt.Sprintf("doc-%04d", n))
+		return err
+	})
+
+	var wantLive, wantDeleted int64
+	for n := range workers * docsPerWorker {
+		if n%5 == 0 {
+			continue
+		}
+		if n%3 == 0 {
+			wantDeleted++
+		} else {
+			wantLive++
+		}
+	}
+	assertDocumentCounts(t, s, db, wantLive, wantDeleted)
+}
+
+func TestDatabaseStatsMixedBulkAndSingleWritesDoNotDeadlock(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_database_stats_lock_order")
+
+	const bulkWorkers = 4
+	const existingPerWorker = 12
+	const newPerWorker = 12
+	const singleWrites = 48
+	seed := make([]BulkWrite, bulkWorkers*existingPerWorker)
+	for i := range seed {
+		seed[i] = BulkWrite{
+			ID:   fmt.Sprintf("existing-%04d", i),
+			Body: map[string]any{"version": json.Number("1")},
+		}
+	}
+	seeded, err := s.BulkPutDocs(ctx, db, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range seeded {
+		if seeded[i].Err != nil {
+			t.Fatalf("seeding document %d: %v", i, seeded[i].Err)
+		}
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, bulkWorkers+1)
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(bulkWorkers + 1)
+	done.Add(bulkWorkers + 1)
+	for worker := range bulkWorkers {
+		go func() {
+			defer done.Done()
+			writes := make([]BulkWrite, 0, existingPerWorker+newPerWorker)
+			for offset := range existingPerWorker {
+				if worker%2 == 1 {
+					offset = existingPerWorker - offset - 1
+				}
+				i := worker*existingPerWorker + offset
+				rev := seeded[i].Rev
+				writes = append(writes,
+					BulkWrite{
+						ID:       seed[i].ID,
+						Body:     map[string]any{"version": json.Number("2")},
+						Expected: &rev,
+					},
+					BulkWrite{
+						ID: fmt.Sprintf("bulk-new-%d-%04d", worker, offset),
+						Body: map[string]any{
+							"worker": json.Number(strconv.Itoa(worker)),
+						},
+					},
+				)
+			}
+			ready.Done()
+			<-start
+			results, err := s.BulkPutDocs(ctx, db, writes)
+			if err != nil {
+				errs <- err
+				return
+			}
+			for _, result := range results {
+				if result.Err != nil {
+					errs <- result.Err
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer done.Done()
+		ready.Done()
+		<-start
+		for i := range singleWrites {
+			if _, _, err := s.PutDoc(ctx, db, fmt.Sprintf("single-%04d", i),
+				map[string]any{"i": json.Number(strconv.Itoa(i))},
+				nil, nil, false, nil); err != nil {
+				errs <- err
+				return
+			}
+		}
+	}()
+	ready.Wait()
+	close(start)
+	done.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	wantLive := int64(len(seed) + bulkWorkers*newPerWorker + singleWrites)
+	assertDocumentCounts(t, s, db, wantLive, 0)
+}
+
 func assertDocumentCounts(t *testing.T, s *Store, db *DB, wantLive, wantDeleted int64) {
 	t.Helper()
 	info, err := s.DBInfo(t.Context(), db)
@@ -788,16 +970,23 @@ func assertDocumentCounts(t *testing.T, s *Store, db *DB, wantLive, wantDeleted 
 		t.Fatalf("metadata counts = (%d, %d), want (%d, %d)",
 			info.DocCount, info.DocDelCount, wantLive, wantDeleted)
 	}
-	var actualLive, actualDeleted int64
+	externalSize := "coalesce(sum(external_size), 0)"
+	if db.Partitioned {
+		externalSize = "coalesce(sum(external_size) FILTER (WHERE strpos(id, ':') > 1), 0)"
+	}
+	var actualLive, actualDeleted, actualExternal int64
 	if err := s.pool.QueryRow(t.Context(), fmt.Sprintf(
 		`SELECT count(*) FILTER (WHERE NOT deleted),
-		        count(*) FILTER (WHERE deleted) FROM %s.docs`, db.Schema),
-	).Scan(&actualLive, &actualDeleted); err != nil {
+		        count(*) FILTER (WHERE deleted), %s
+		 FROM %s.docs`, externalSize, db.Schema),
+	).Scan(&actualLive, &actualDeleted, &actualExternal); err != nil {
 		t.Fatal(err)
 	}
-	if actualLive != info.DocCount || actualDeleted != info.DocDelCount {
-		t.Fatalf("metadata counts = (%d, %d), table counts = (%d, %d)",
-			info.DocCount, info.DocDelCount, actualLive, actualDeleted)
+	if actualLive != info.DocCount || actualDeleted != info.DocDelCount ||
+		actualExternal != info.ExternalSize {
+		t.Fatalf("metadata stats = (%d, %d, %d), table stats = (%d, %d, %d)",
+			info.DocCount, info.DocDelCount, info.ExternalSize,
+			actualLive, actualDeleted, actualExternal)
 	}
 }
 

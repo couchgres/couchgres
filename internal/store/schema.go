@@ -1,9 +1,16 @@
 package store
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // SQL DDL. Per-database schema names are generated as db_<hex>.
 // They are identifier-safe by construction, so interpolation is safe.
+
+// databaseStatStripes must remain a power of two because the SQL uses its
+// predecessor as a hash mask.
+const databaseStatStripes = 32
 
 const globalDDL = `
 CREATE SCHEMA IF NOT EXISTS couchgres;
@@ -19,9 +26,6 @@ CREATE TABLE IF NOT EXISTS couchgres.databases (
 ALTER TABLE couchgres.databases
     ADD COLUMN IF NOT EXISTS purge_seq bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS purged_infos_limit bigint NOT NULL DEFAULT 1000,
-    ADD COLUMN IF NOT EXISTS doc_count bigint NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS doc_del_count bigint NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS doc_counts_initialized boolean NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS update_seq bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS update_seq_initialized boolean NOT NULL DEFAULT false;
 
@@ -73,50 +77,6 @@ $partition_locks$;
 -- default collation. This expression index supports both scan directions.
 CREATE INDEX IF NOT EXISTS databases_name_c_idx
     ON couchgres.databases (name COLLATE "C");
-
--- Statement-level transition tables make one counter adjustment per write
--- statement, including a whole _bulk_docs winner refresh. The INSERT and UPDATE
--- triggers both run for INSERT ... ON CONFLICT DO UPDATE, but each transition
--- table contains only the rows for its event.
-CREATE OR REPLACE FUNCTION couchgres.update_doc_counts()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $doc_counts$
-DECLARE
-    live_delta bigint := 0;
-    deleted_delta bigint := 0;
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        SELECT count(*) FILTER (WHERE NOT deleted),
-               count(*) FILTER (WHERE deleted)
-          INTO live_delta, deleted_delta
-          FROM new_docs;
-    ELSIF TG_OP = 'UPDATE' THEN
-        SELECT
-          (SELECT count(*) FILTER (WHERE NOT deleted) FROM new_docs)
-            - (SELECT count(*) FILTER (WHERE NOT deleted) FROM old_docs),
-          (SELECT count(*) FILTER (WHERE deleted) FROM new_docs)
-            - (SELECT count(*) FILTER (WHERE deleted) FROM old_docs)
-          INTO live_delta, deleted_delta;
-    ELSIF TG_OP = 'DELETE' THEN
-        SELECT -(count(*) FILTER (WHERE NOT deleted)),
-               -(count(*) FILTER (WHERE deleted))
-          INTO live_delta, deleted_delta
-          FROM old_docs;
-    END IF;
-
-    IF live_delta <> 0 OR deleted_delta <> 0 THEN
-        UPDATE couchgres.databases
-           SET doc_count = doc_count + live_delta,
-               doc_del_count = doc_del_count + deleted_delta
-         WHERE schema_name = TG_TABLE_SCHEMA;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'database metadata missing for schema %', TG_TABLE_SCHEMA;
-        END IF;
-    END IF;
-    RETURN NULL;
-END
-$doc_counts$;
 
 CREATE TABLE IF NOT EXISTS couchgres.server_config (
     section text NOT NULL,
@@ -216,33 +176,149 @@ CREATE TABLE {s}.view_state (
 `
 
 func dbDDL(schema string, partitioned bool) string {
-	ddl := strings.ReplaceAll(dbDDLTemplate, "{s}", schema) + docCountTriggers(schema)
+	ddl := strings.ReplaceAll(dbDDLTemplate, "{s}", schema) + databaseStatsDDL(schema, partitioned)
 	if partitioned {
 		ddl += partitionStatsDDL(schema)
 	}
 	return ddl
 }
 
-const docCountTriggersTemplate = `
-DROP TRIGGER IF EXISTS docs_count_insert ON {s}.docs;
+// Exact database totals are split across 32 stable document-ID stripes. The
+// table and its primary key stay in the database schema so each hot row is
+// narrow. A single-document statement touches one stripe; bulk writers lock
+// their union of INSERT and UPDATE stripes in ascending order before upserting.
+// Partitioned database external bytes retain CouchDB's partition-document
+// scope, while live/deleted counts continue to include design documents.
+const databaseStatsDDLTemplate = `
+CREATE TABLE {s}.database_stats (
+    stripe        smallint PRIMARY KEY CHECK (stripe >= 0 AND stripe < {stripe_count}),
+    doc_count     bigint NOT NULL DEFAULT 0 CHECK (doc_count >= 0),
+    doc_del_count bigint NOT NULL DEFAULT 0 CHECK (doc_del_count >= 0),
+    external_size bigint NOT NULL DEFAULT 0 CHECK (external_size >= 0)
+);
+INSERT INTO {s}.database_stats (stripe)
+SELECT generate_series(0, {stripe_mask})::smallint;
+
+CREATE FUNCTION {s}.lock_database_stats(document_ids text[])
+RETURNS void
+LANGUAGE plpgsql
+AS $database_stat_locks$
+BEGIN
+    PERFORM stats.stripe
+      FROM {s}.database_stats AS stats
+     WHERE stats.stripe IN (
+           SELECT DISTINCT (hashtextextended(id, 0) & {stripe_mask})::smallint
+             FROM unnest(document_ids) AS ids(id)
+       )
+     ORDER BY stats.stripe
+     FOR UPDATE;
+END
+$database_stat_locks$;
+
+CREATE FUNCTION {s}.update_database_stats()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $database_stats$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        UPDATE {s}.database_stats AS stats
+           SET doc_count = stats.doc_count + delta.live_delta,
+               doc_del_count = stats.doc_del_count + delta.deleted_delta,
+               external_size = stats.external_size + delta.size_delta
+          FROM (
+            SELECT (hashtextextended(id, 0) & {stripe_mask})::smallint AS stripe,
+                   count(*) FILTER (WHERE NOT deleted) AS live_delta,
+                   count(*) FILTER (WHERE deleted) AS deleted_delta,
+                   coalesce(sum(CASE WHEN {insert_external}
+                                     THEN external_size ELSE 0 END), 0) AS size_delta
+              FROM new_docs
+             GROUP BY 1
+          ) AS delta
+         WHERE stats.stripe = delta.stripe;
+    ELSIF TG_OP = 'UPDATE' THEN
+        UPDATE {s}.database_stats AS stats
+           SET doc_count = stats.doc_count + delta.live_delta,
+               doc_del_count = stats.doc_del_count + delta.deleted_delta,
+               external_size = stats.external_size + delta.size_delta
+          FROM (
+            SELECT (hashtextextended(n.id, 0) & {stripe_mask})::smallint AS stripe,
+                   sum(CASE WHEN NOT n.deleted THEN 1 ELSE 0 END
+                     - CASE WHEN NOT o.deleted THEN 1 ELSE 0 END) AS live_delta,
+                   sum(CASE WHEN n.deleted THEN 1 ELSE 0 END
+                     - CASE WHEN o.deleted THEN 1 ELSE 0 END) AS deleted_delta,
+                   sum(CASE WHEN {update_external}
+                            THEN n.external_size - o.external_size ELSE 0 END) AS size_delta
+              FROM new_docs AS n JOIN old_docs AS o USING (id)
+             WHERE n.deleted IS DISTINCT FROM o.deleted
+                OR ({update_external}
+                    AND n.external_size IS DISTINCT FROM o.external_size)
+             GROUP BY 1
+          ) AS delta
+         WHERE stats.stripe = delta.stripe;
+    ELSIF TG_OP = 'DELETE' THEN
+        UPDATE {s}.database_stats AS stats
+           SET doc_count = stats.doc_count + delta.live_delta,
+               doc_del_count = stats.doc_del_count + delta.deleted_delta,
+               external_size = stats.external_size + delta.size_delta
+          FROM (
+            SELECT (hashtextextended(id, 0) & {stripe_mask})::smallint AS stripe,
+                   -(count(*) FILTER (WHERE NOT deleted)) AS live_delta,
+                   -(count(*) FILTER (WHERE deleted)) AS deleted_delta,
+                   -coalesce(sum(CASE WHEN {delete_external}
+                                      THEN external_size ELSE 0 END), 0) AS size_delta
+              FROM old_docs
+             GROUP BY 1
+          ) AS delta
+         WHERE stats.stripe = delta.stripe;
+    END IF;
+    RETURN NULL;
+END
+$database_stats$;
+
+CREATE FUNCTION {s}.reject_doc_id_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $doc_id_immutable$
+BEGIN
+    RAISE EXCEPTION 'document ID cannot be changed';
+END
+$doc_id_immutable$;
+
+CREATE TRIGGER docs_id_immutable
+BEFORE UPDATE OF id ON {s}.docs
+FOR EACH ROW EXECUTE FUNCTION {s}.reject_doc_id_change();
+
 CREATE TRIGGER docs_count_insert
 AFTER INSERT ON {s}.docs
 REFERENCING NEW TABLE AS new_docs
-FOR EACH STATEMENT EXECUTE FUNCTION couchgres.update_doc_counts();
-DROP TRIGGER IF EXISTS docs_count_update ON {s}.docs;
+FOR EACH STATEMENT EXECUTE FUNCTION {s}.update_database_stats();
 CREATE TRIGGER docs_count_update
 AFTER UPDATE ON {s}.docs
 REFERENCING OLD TABLE AS old_docs NEW TABLE AS new_docs
-FOR EACH STATEMENT EXECUTE FUNCTION couchgres.update_doc_counts();
-DROP TRIGGER IF EXISTS docs_count_delete ON {s}.docs;
+FOR EACH STATEMENT EXECUTE FUNCTION {s}.update_database_stats();
 CREATE TRIGGER docs_count_delete
 AFTER DELETE ON {s}.docs
 REFERENCING OLD TABLE AS old_docs
-FOR EACH STATEMENT EXECUTE FUNCTION couchgres.update_doc_counts();
+FOR EACH STATEMENT EXECUTE FUNCTION {s}.update_database_stats();
 `
 
-func docCountTriggers(schema string) string {
-	return strings.ReplaceAll(docCountTriggersTemplate, "{s}", schema)
+func databaseStatsDDL(schema string, partitioned bool) string {
+	insertExternal := "true"
+	updateExternal := "true"
+	deleteExternal := "true"
+	if partitioned {
+		insertExternal = "strpos(id, ':') > 1"
+		updateExternal = "strpos(n.id, ':') > 1"
+		deleteExternal = "strpos(id, ':') > 1"
+	}
+	return strings.NewReplacer(
+		"{s}", schema,
+		"{stripe_count}", strconv.Itoa(databaseStatStripes),
+		"{stripe_mask}", strconv.Itoa(databaseStatStripes-1),
+		"{insert_external}", insertExternal,
+		"{update_external}", updateExternal,
+		"{delete_external}", deleteExternal,
+	).Replace(databaseStatsDDLTemplate)
 }
 
 // Partition statistics are striped by document hash so shrinking writes and

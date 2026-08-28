@@ -210,8 +210,8 @@ func (s *Store) Bootstrap(ctx context.Context) (string, error) {
 
 	// Databases created before docs_design_seq_idx existed get it here,
 	// ones from when docs still carried bodies lose the column (winner bodies
-	// live in revs), and databases from before transactional update sequences or
-	// document counters receive a one-time backfill. New schemas already match.
+	// live in revs), and databases from before transactional update sequences
+	// receive a one-time sequence backfill. New schemas already match.
 	rows, err := s.pool.Query(ctx, "SELECT schema_name FROM couchgres.databases")
 	if err != nil {
 		return "", err
@@ -232,9 +232,6 @@ func (s *Store) Bootstrap(ctx context.Context) (string, error) {
 		}
 		if err := s.initializeUpdateSeq(ctx, schema); err != nil {
 			return "", fmt.Errorf("migrating update sequence for %s: %w", schema, err)
-		}
-		if err := s.initializeDocCounts(ctx, schema); err != nil {
-			return "", fmt.Errorf("migrating document counts for %s: %w", schema, err)
 		}
 	}
 
@@ -349,55 +346,6 @@ func (s *Store) initializeUpdateSeq(ctx context.Context, schema string) error {
 		`UPDATE couchgres.databases
 		 SET update_seq = $1, update_seq_initialized = true
 		 WHERE schema_name = $2`, current, schema); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
-// initializeDocCounts installs counter triggers and backfills databases created
-// before document counters existed. The trigger DDL fences docs mutations while
-// the registry row is populated from a consistent committed state.
-func (s *Store) initializeDocCounts(ctx context.Context, schema string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	var initialized bool
-	err = tx.QueryRow(ctx,
-		`SELECT doc_counts_initialized FROM couchgres.databases
-		 WHERE schema_name = $1`, schema,
-	).Scan(&initialized)
-	if err == pgx.ErrNoRows || initialized {
-		return tx.Rollback(ctx)
-	}
-	if err != nil {
-		return err
-	}
-
-	// Install the triggers before locking metadata. The trigger DDL first waits
-	// for older writers to finish and then blocks new docs mutations, avoiding a
-	// docs-lock/metadata-lock inversion during a rolling upgrade.
-	if _, err := tx.Exec(ctx, docCountTriggers(schema)); err != nil {
-		return err
-	}
-	err = tx.QueryRow(ctx,
-		`SELECT doc_counts_initialized FROM couchgres.databases
-		 WHERE schema_name = $1 FOR UPDATE`, schema,
-	).Scan(&initialized)
-	if err == pgx.ErrNoRows || initialized {
-		return tx.Rollback(ctx)
-	}
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(
-		`UPDATE couchgres.databases
-		 SET doc_count = (SELECT count(*) FROM %[1]s.docs WHERE NOT deleted),
-		     doc_del_count = (SELECT count(*) FROM %[1]s.docs WHERE deleted),
-		     doc_counts_initialized = true
-		 WHERE schema_name = $1`, schema), schema); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

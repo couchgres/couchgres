@@ -157,9 +157,7 @@ func (s *Store) AllDocs(ctx context.Context, db *DB, p *AllDocsParams) (*AllDocs
 		page.Offset = &offset
 	}
 
-	if err := s.pool.QueryRow(ctx,
-		"SELECT doc_count FROM couchgres.databases WHERE name = $1", db.Name,
-	).Scan(&page.TotalRows); err != nil {
+	if page.TotalRows, err = s.documentCount(ctx, db); err != nil {
 		return nil, err
 	}
 	if p.UpdateSeq {
@@ -270,9 +268,7 @@ func (s *Store) AllDocsKeys(
 		}
 	}
 
-	if err := s.pool.QueryRow(ctx,
-		"SELECT doc_count FROM couchgres.databases WHERE name = $1", db.Name,
-	).Scan(&page.TotalRows); err != nil {
+	if page.TotalRows, err = s.documentCount(ctx, db); err != nil {
 		return nil, err
 	}
 	if updateSeq {
@@ -291,4 +287,13 @@ func (s *Store) CurrentSeq(ctx context.Context, db *DB) (int64, error) {
 		"SELECT update_seq FROM couchgres.databases WHERE name = $1", db.Name,
 	).Scan(&seq)
 	return seq, err
+}
+
+func (s *Store) documentCount(ctx context.Context, db *DB) (int64, error) {
+	var count int64
+	err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		`SELECT coalesce(sum(doc_count), 0)
+		 FROM %s.database_stats`, db.Schema),
+	).Scan(&count)
+	return count, err
 }

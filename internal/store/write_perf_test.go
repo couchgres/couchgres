@@ -416,3 +416,100 @@ func BenchmarkPutDocConcurrentCreates(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkDocumentCounterContention isolates the docs-table trigger from
+// revision hashing and transactional sequence allocation. It makes contention
+// on the exact database counters visible independently of the rest of PutDoc.
+func BenchmarkDocumentCounterContention(b *testing.B) {
+	counter := &writeQueryCounter{}
+	s := writePerfStore(b, counter)
+
+	for _, clients := range []int{1, 16} {
+		b.Run(fmt.Sprintf("%d_clients", clients), func(b *testing.B) {
+			db := freshDB(b, s, fmt.Sprintf("bench_doc_counters_%d", clients))
+			query := fmt.Sprintf(
+				`INSERT INTO %s.docs
+				   (id, rev_num, rev_hash, deleted, seq, external_size)
+				 VALUES ($1, 1, 'benchmark', false, $2, 1)`, db.Schema)
+			latencies := make([]time.Duration, b.N)
+			errs := make(chan error, clients)
+			var wg sync.WaitGroup
+			lsn := startWriteBenchmark(b, s, counter)
+			for worker := range clients {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := worker; i < b.N; i += clients {
+						started := time.Now()
+						_, err := s.pool.Exec(b.Context(), query,
+							fmt.Sprintf("doc-%08d", i), i+1)
+						latencies[i] = time.Since(started)
+						if err != nil {
+							errs <- err
+							return
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				b.Error(err)
+			}
+			reportWriteBenchmark(b, s, counter, lsn, latencies)
+		})
+	}
+}
+
+// BenchmarkDatabaseStatsRead compares the fixed stripe aggregate used by
+// database info with the former exact winner-table scan. The document count is
+// intentionally large enough to make the different growth rates visible.
+func BenchmarkDatabaseStatsRead(b *testing.B) {
+	counter := &writeQueryCounter{}
+	s := writePerfStore(b, counter)
+	db := freshDB(b, s, "bench_database_stats_read")
+	const documents = 100_000
+	if _, err := s.pool.Exec(b.Context(), fmt.Sprintf(
+		`INSERT INTO %s.docs
+		   (id, rev_num, rev_hash, deleted, seq, external_size)
+		 SELECT 'doc-' || lpad(n::text, 8, '0'), 1, 'benchmark', false, n, 128
+		 FROM generate_series(1, $1) AS docs(n)`, db.Schema), documents); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("striped_metadata", func(b *testing.B) {
+		var live, deleted, external int64
+		b.ResetTimer()
+		for range b.N {
+			if err := s.pool.QueryRow(b.Context(), fmt.Sprintf(
+				`SELECT coalesce(sum(doc_count), 0),
+				        coalesce(sum(doc_del_count), 0),
+				        coalesce(sum(external_size), 0)
+				 FROM %s.database_stats`, db.Schema),
+			).Scan(&live, &deleted, &external); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if live != documents || deleted != 0 || external != documents*128 {
+			b.Fatalf("striped stats = (%d, %d, %d)", live, deleted, external)
+		}
+	})
+
+	b.Run("winner_table_scan", func(b *testing.B) {
+		var live, deleted, external int64
+		b.ResetTimer()
+		for range b.N {
+			if err := s.pool.QueryRow(b.Context(), fmt.Sprintf(
+				`SELECT count(*) FILTER (WHERE NOT deleted),
+				        count(*) FILTER (WHERE deleted),
+				        coalesce(sum(external_size), 0)
+				 FROM %s.docs`, db.Schema),
+			).Scan(&live, &deleted, &external); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if live != documents || deleted != 0 || external != documents*128 {
+			b.Fatalf("winner-table stats = (%d, %d, %d)", live, deleted, external)
+		}
+	})
+}

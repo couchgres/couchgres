@@ -67,8 +67,8 @@ func (s *Store) CreateDatabase(ctx context.Context, name string, partitioned boo
 	tag, err := tx.Exec(ctx,
 		`INSERT INTO couchgres.databases
 		   (name, schema_name, partitioned, instance_start_time,
-		    doc_counts_initialized, update_seq_initialized)
-		 VALUES ($1, $2, $3, $4, true, true) ON CONFLICT (name) DO NOTHING`,
+		    update_seq_initialized)
+		 VALUES ($1, $2, $3, $4, true) ON CONFLICT (name) DO NOTHING`,
 		name, schema, partitioned, startTime,
 	)
 	if err != nil {
@@ -281,18 +281,17 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 	}
 	defer tx.Rollback(ctx)
 
-	query := `SELECT name, schema_name, partitioned, revs_limit,
-	                 instance_start_time, doc_count, doc_del_count, purge_seq,
-	                 update_seq
-	          FROM couchgres.databases`
+	query := `SELECT d.name, d.schema_name, d.partitioned, d.revs_limit,
+	                 d.instance_start_time, d.purge_seq, d.update_seq
+	          FROM couchgres.databases d`
 	var args []any
 	if names != nil {
-		query += " WHERE name = ANY($1)"
+		query += " WHERE d.name = ANY($1)"
 		args = append(args, names)
 	}
 	// Keep schemas alive while the dynamic detail query resolves their
-	// relations. KEY SHARE still permits normal count/purge metadata updates.
-	query += ` ORDER BY name COLLATE "C" FOR KEY SHARE`
+	// relations. KEY SHARE still permits normal sequence/purge metadata updates.
+	query += ` ORDER BY d.name COLLATE "C" FOR KEY SHARE OF d`
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -303,8 +302,7 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 		if err := rows.Scan(
 			&item.DB.Name, &item.DB.Schema, &item.DB.Partitioned,
 			&item.DB.RevsLimit, &item.DB.InstanceStartTime,
-			&item.Info.DocCount, &item.Info.DocDelCount, &item.Info.PurgeSeq,
-			&item.Info.UpdateSeq,
+			&item.Info.PurgeSeq, &item.Info.UpdateSeq,
 		); err != nil {
 			rows.Close()
 			return nil, err
@@ -320,6 +318,8 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 	for i := range infos {
 		byName[infos[i].DB.Name] = i
 	}
+	// Each detail batch re-reads mutable registry values alongside the stripe
+	// aggregates, giving counts, bytes, and cursors one statement snapshot.
 	for start := 0; start < len(infos); start += databaseInfoBatchSize {
 		end := min(start+databaseInfoBatchSize, len(infos))
 		detailQuery, detailArgs := databaseInfoDetailsQuery(infos[start:end])
@@ -329,8 +329,13 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 		}
 		for details.Next() {
 			var name string
-			var sizeBytes, externalSize int64
-			if err := details.Scan(&name, &sizeBytes, &externalSize); err != nil {
+			var sizeBytes, docCount, docDelCount, externalSize int64
+			var purgeSeq, updateSeq int64
+			var revsLimit int
+			if err := details.Scan(
+				&name, &sizeBytes, &docCount, &docDelCount, &externalSize,
+				&purgeSeq, &updateSeq, &revsLimit,
+			); err != nil {
 				details.Close()
 				return nil, err
 			}
@@ -340,7 +345,12 @@ func (s *Store) DatabaseInfos(ctx context.Context, names []string) ([]DatabaseIn
 				return nil, fmt.Errorf("database info returned unknown database %q", name)
 			}
 			infos[i].Info.SizeBytes = sizeBytes
+			infos[i].Info.DocCount = docCount
+			infos[i].Info.DocDelCount = docDelCount
 			infos[i].Info.ExternalSize = externalSize
+			infos[i].Info.PurgeSeq = purgeSeq
+			infos[i].Info.UpdateSeq = updateSeq
+			infos[i].DB.RevsLimit = revsLimit
 		}
 		details.Close()
 		if err := details.Err(); err != nil {
@@ -361,18 +371,21 @@ func databaseInfoDetailsQuery(infos []DatabaseInfo) (string, []any) {
 			query.WriteString(" UNION ALL ")
 		}
 		args[i] = item.DB.Name
-		externalSize := fmt.Sprintf(
-			"(SELECT coalesce(sum(external_size), 0) FROM %s.docs)", item.DB.Schema)
-		if item.DB.Partitioned {
-			externalSize = fmt.Sprintf(
-				"(SELECT coalesce(sum(external_size), 0) FROM %s.partition_stats)",
-				item.DB.Schema)
-		}
 		fmt.Fprintf(&query, `SELECT $%d::text,
 		   pg_total_relation_size('%[2]s.docs')
 		     + pg_total_relation_size('%[2]s.revs')
-		     + pg_total_relation_size('%[2]s.attachments'), %[3]s`,
-			i+1, item.DB.Schema, externalSize)
+		     + pg_total_relation_size('%[2]s.attachments'),
+		   stats.doc_count, stats.doc_del_count, stats.external_size,
+		   d.purge_seq, d.update_seq, d.revs_limit
+		 FROM couchgres.databases AS d
+		 CROSS JOIN LATERAL (
+		   SELECT coalesce(sum(doc_count), 0) AS doc_count,
+		          coalesce(sum(doc_del_count), 0) AS doc_del_count,
+		          coalesce(sum(external_size), 0) AS external_size
+		   FROM %[2]s.database_stats
+		 ) AS stats
+		 WHERE d.name = $%[1]d`,
+			i+1, item.DB.Schema)
 	}
 	return query.String(), args
 }

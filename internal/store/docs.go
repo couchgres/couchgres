@@ -512,11 +512,17 @@ func (s *Store) bulkPutDocs(
 		// per-database cursor row or waking changes listeners.
 		return results, nil
 	}
+	// Every winner write takes the registry cursor before its statistic stripe.
+	// Bulk statements then pre-lock all touched stripes in numeric order so the
+	// INSERT and UPDATE transition triggers cannot invert stripe locks.
 	tag, err := tx.Exec(ctx, fmt.Sprintf(
 		`WITH allocated AS (
 		   UPDATE couchgres.databases SET update_seq = update_seq + $2
 		   WHERE name = $3
 		   RETURNING update_seq - $2 + 1 AS first_seq
+		 ), locked AS MATERIALIZED (
+		   SELECT %[1]s.lock_database_stats($1)
+		   WHERE EXISTS (SELECT 1 FROM allocated)
 		 ), ordered AS (
 		   SELECT t.id, t.ord FROM unnest($1::text[]) WITH ORDINALITY AS t(id, ord)
 		 ), w AS (
@@ -530,6 +536,7 @@ func (s *Store) bulkPutDocs(
 		 SELECT w.id, w.rev_num, w.rev_hash, w.deleted,
 		        a.first_seq + o.ord - 1, w.external_size
 		 FROM w JOIN ordered o ON o.id = w.id CROSS JOIN allocated a
+		 WHERE EXISTS (SELECT 1 FROM locked)
 		 ORDER BY o.ord
 		 ON CONFLICT (id) DO UPDATE SET rev_num = EXCLUDED.rev_num,
 		   rev_hash = EXCLUDED.rev_hash, deleted = EXCLUDED.deleted,

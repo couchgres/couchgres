@@ -237,6 +237,31 @@ func TestConcurrentPartitionGrowthSerializesAtLimit(t *testing.T) {
 	assertPartitionStats(t, s, db, "p", 1, 0, 2)
 }
 
+func TestPartitionedDatabaseStatsExcludeDesignDocBytes(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshPartitionDB(t, s, "it_partition_database_stats")
+	partitionBody := body(t, `{"value":"partition"}`)
+	if _, _, err := s.PutDoc(ctx, db, "p:doc", partitionBody,
+		nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.PutDoc(ctx, db, "_design/rules",
+		body(t, `{"views":{"all":{"map":"function(d){emit(d._id)}"}}}`),
+		nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := s.DBInfo(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantExternal := int64(len(couch.CanonicalBody(partitionBody)))
+	if info.DocCount != 2 || info.DocDelCount != 0 || info.ExternalSize != wantExternal {
+		t.Fatalf("partitioned database stats = %+v, want 2/0/%d", info, wantExternal)
+	}
+}
+
 func assertPartitionStats(
 	t *testing.T,
 	s *Store,
