@@ -506,6 +506,15 @@ func (s *Server) addAttachmentsMember(
 	if err != nil {
 		return err
 	}
+	return addAttachmentsMemberFrom(doc, atts, includeData, encodingInfo)
+}
+
+func addAttachmentsMemberFrom(
+	doc map[string]any,
+	atts []store.Attachment,
+	includeData bool,
+	encodingInfo bool,
+) error {
 	if len(atts) == 0 {
 		return nil
 	}

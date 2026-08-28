@@ -43,6 +43,9 @@ type changesRequest struct {
 	timeout     time.Duration
 	conflicts   bool
 	attachments bool // include_docs docs carry attachment data
+	// filteredAttachments delays attachment loading until application-level
+	// filtering has selected the rows that will actually be returned.
+	filteredAttachments bool
 	// filterFn, when set, decides which changes are emitted. The store query
 	// then runs with IncludeDocs (filters see documents) and without a limit
 	// (the limit counts post-filter rows). userIncludeDocs and userLimit
@@ -112,6 +115,8 @@ func (s *Server) parseChangesRequest(r *http.Request, db *store.DB, body map[str
 	if req.attachments, err = boolParam(q, "attachments", false); err != nil {
 		return nil, err
 	}
+	req.params.IncludeAttachments = req.params.IncludeDocs
+	req.params.AttachmentData = req.attachments && req.params.IncludeDocs
 	// conflicts=true only matters when docs are included (CouchDB ignores
 	// it otherwise).
 	req.params.Conflicts = req.conflicts && req.params.IncludeDocs
@@ -155,6 +160,10 @@ func (s *Server) parseChangesRequest(r *http.Request, db *store.DB, body map[str
 	if req.filterFn != nil {
 		req.userIncludeDocs = req.params.IncludeDocs
 		req.userLimit = req.params.Limit
+		if req.params.IncludeAttachments {
+			req.filteredAttachments = true
+			req.params.IncludeAttachments = false
+		}
 		req.params.IncludeDocs = true
 		req.params.Limit = nil
 	}
@@ -231,10 +240,19 @@ func (s *Server) changesImpl(w http.ResponseWriter, r *http.Request, body map[st
 
 // changeRowJSON is changeJSON plus the _attachments member on included
 // docs (stubs, data with attachments=true, encoding via att_encoding_info).
-func (s *Server) changeRowJSON(r *http.Request, db *store.DB, c store.Change, req *changesRequest) (map[string]any, error) {
+func (s *Server) changeRowJSON(
+	r *http.Request,
+	c store.Change,
+	req *changesRequest,
+) (map[string]any, error) {
 	row := changeJSON(c, req.conflicts)
-	if doc, ok := row["doc"].(map[string]any); ok && len(c.LeafRevs) > 0 {
-		if err := s.addAttachmentsMember(r, db, doc, c.ID, c.LeafRevs[0], req.attachments); err != nil {
+	if doc, ok := row["doc"].(map[string]any); ok {
+		encodingInfo, err := boolParam(r.URL.Query(), "att_encoding_info", false)
+		if err != nil {
+			return nil, err
+		}
+		if err := addAttachmentsMemberFrom(
+			doc, c.Attachments, req.attachments, encodingInfo); err != nil {
 			return nil, err
 		}
 	}
@@ -349,9 +367,15 @@ func (s *Server) changesNormal(w http.ResponseWriter, r *http.Request, db *store
 			}
 		}
 	}
+	if req.filteredAttachments {
+		if err := s.store.AttachChangeAttachments(
+			r.Context(), db, filtered, req.attachments); err != nil {
+			return err
+		}
+	}
 	rows := make([]any, 0, len(filtered))
 	for _, c := range filtered {
-		row, err := s.changeRowJSON(r, db, c, req)
+		row, err := s.changeRowJSON(r, c, req)
 		if err != nil {
 			return err
 		}
@@ -416,7 +440,7 @@ func (s *Server) changesStream(w http.ResponseWriter, r *http.Request, db *store
 	defer unsubscribe()
 
 	emit := func(c store.Change) error {
-		rowJSON, err := s.changeRowJSON(r, db, c, req)
+		rowJSON, err := s.changeRowJSON(r, c, req)
 		if err != nil {
 			return err
 		}
@@ -461,6 +485,22 @@ func (s *Server) changesStream(w http.ResponseWriter, r *http.Request, db *store
 		filtered, err := applyChangesFilter(r.Context(), req, changes)
 		if err != nil {
 			return nil
+		}
+		if limit != nil {
+			remaining := *limit - emitted
+			if remaining <= 0 {
+				finishStream(w, eventsource, since)
+				return nil
+			}
+			if int64(len(filtered)) > remaining {
+				filtered = filtered[:remaining]
+			}
+		}
+		if req.filteredAttachments {
+			if err := s.store.AttachChangeAttachments(
+				r.Context(), db, filtered, req.attachments); err != nil {
+				return nil
+			}
 		}
 		for _, c := range filtered {
 			if err := emit(c); err != nil {

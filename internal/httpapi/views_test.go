@@ -130,6 +130,86 @@ func TestViewMapQuery(t *testing.T) {
 	}
 }
 
+func TestViewAndChangesBatchIncludedAttachments(t *testing.T) {
+	s := testServer(t, testHTTPStore(t))
+	admin := adminAuth()
+	const db = "vbatch_include_docs"
+	send(t, s, "DELETE", "/"+db, nil, testAdminAuth, admin)
+	if resp := send(t, s, "PUT", "/"+db, nil, testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("create database: %+v", resp)
+	}
+	t.Cleanup(func() { send(t, s, "DELETE", "/"+db, nil, testAdminAuth, admin) })
+
+	doc := decode(t, `{
+	  "kind":"included",
+	  "_attachments":{"hello.txt":{"content_type":"text/plain","data":"aGVsbG8="}}
+	}`)
+	if resp := send(t, s, "PUT", "/"+db+"/target", doc,
+		testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("create attached doc: %+v", resp)
+	}
+	ddoc := map[string]any{
+		"views": map[string]any{
+			"bykind": map[string]any{
+				"map": "function(doc){ if (doc.kind) emit(doc.kind, null); }",
+			},
+		},
+	}
+	if resp := send(t, s, "PUT", "/"+db+"/_design/batch", ddoc,
+		testAdminAuth, admin); resp.status != 201 {
+		t.Fatalf("create view: %+v", resp)
+	}
+
+	viewDoc := func(path string) map[string]any {
+		t.Helper()
+		resp := send(t, s, "GET", path, nil, testAdminAuth, admin)
+		if resp.status != 200 || len(resp.body["rows"].([]any)) != 1 {
+			t.Fatalf("view response: %+v", resp)
+		}
+		return resp.body["rows"].([]any)[0].(map[string]any)["doc"].(map[string]any)
+	}
+	stubDoc := viewDoc("/" + db +
+		`/_design/batch/_view/bykind?key="included"&include_docs=true`)
+	stub := stubDoc["_attachments"].(map[string]any)["hello.txt"].(map[string]any)
+	if stub["stub"] != true || stub["length"] != float64(5) {
+		t.Fatalf("view attachment stub: %+v", stub)
+	}
+	dataDoc := viewDoc("/" + db +
+		`/_design/batch/_view/bykind?key="included"&include_docs=true&attachments=true`)
+	data := dataDoc["_attachments"].(map[string]any)["hello.txt"].(map[string]any)
+	if data["data"] != "aGVsbG8=" {
+		t.Fatalf("view attachment data: %+v", data)
+	}
+
+	changeDoc := func(method, path string, body any) map[string]any {
+		t.Helper()
+		resp := send(t, s, method, path, body, testAdminAuth, admin)
+		if resp.status != 200 {
+			t.Fatalf("changes response: %+v", resp)
+		}
+		for _, raw := range resp.body["results"].([]any) {
+			row := raw.(map[string]any)
+			if row["id"] == "target" {
+				return row["doc"].(map[string]any)
+			}
+		}
+		t.Fatalf("target change missing: %+v", resp.body)
+		return nil
+	}
+	changeStub := changeDoc("GET", "/"+db+"/_changes?include_docs=true", nil)
+	stub = changeStub["_attachments"].(map[string]any)["hello.txt"].(map[string]any)
+	if stub["stub"] != true || stub["length"] != float64(5) {
+		t.Fatalf("changes attachment stub: %+v", stub)
+	}
+	filtered := changeDoc("POST", "/"+db+
+		"/_changes?filter=_selector&include_docs=true&attachments=true",
+		map[string]any{"selector": map[string]any{"kind": "included"}})
+	data = filtered["_attachments"].(map[string]any)["hello.txt"].(map[string]any)
+	if data["data"] != "aGVsbG8=" {
+		t.Fatalf("filtered changes attachment data: %+v", data)
+	}
+}
+
 func TestViewReduce(t *testing.T) {
 	h := testHandler(t)
 	admin := adminAuth()

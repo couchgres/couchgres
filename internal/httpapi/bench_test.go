@@ -347,6 +347,41 @@ func BenchmarkViewMapQuery(b *testing.B) {
 	benchReduceQuery(b, "?startkey=[10]&endkey=[11]&reduce=false&limit=20")
 }
 
+func BenchmarkViewIncludeDocs(b *testing.B) {
+	h, db := benchReduceHandler(b, "_sum")
+	path := "/" + db + "/_design/bench/_view/byn?startkey=[10]&endkey=[11]&reduce=false" +
+		"&include_docs=true&update=false&limit=20"
+	if resp := send(b, h, "GET", path, nil, testAdminAuth, adminAuth()); resp.status != 200 || len(resp.body["rows"].([]any)) != 20 {
+		b.Fatalf("warm include_docs view: %+v", resp)
+	}
+	b.ResetTimer()
+	for range b.N {
+		resp := send(b, h, "GET", path, nil, testAdminAuth, adminAuth())
+		if resp.status != 200 || len(resp.body["rows"].([]any)) != 20 {
+			b.Fatalf("include_docs view: %+v", resp)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(20*b.N)/b.Elapsed().Seconds(), "rows/sec")
+}
+
+func BenchmarkChangesIncludeDocs(b *testing.B) {
+	h, db := benchReduceHandler(b, "_sum")
+	path := "/" + db + "/_changes?include_docs=true&limit=20"
+	if resp := send(b, h, "GET", path, nil, testAdminAuth, adminAuth()); resp.status != 200 || len(resp.body["results"].([]any)) != 20 {
+		b.Fatalf("warm include_docs changes: %+v", resp)
+	}
+	b.ResetTimer()
+	for range b.N {
+		resp := send(b, h, "GET", path, nil, testAdminAuth, adminAuth())
+		if resp.status != 200 || len(resp.body["results"].([]any)) != 20 {
+			b.Fatalf("include_docs changes: %+v", resp)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(20*b.N)/b.Elapsed().Seconds(), "rows/sec")
+}
+
 func BenchmarkViewReduceNoGroup(b *testing.B)    { benchReduceQuery(b, "") }
 func BenchmarkViewReduceGroupLevel(b *testing.B) { benchReduceQuery(b, "?group_level=1") }
 func BenchmarkViewReduceGroupTrue(b *testing.B)  { benchReduceQuery(b, "?group=true&limit=100") }

@@ -18,22 +18,23 @@ import (
 
 // ViewQuery is a parsed view request. Key bounds are raw JSON text.
 type ViewQuery struct {
-	Key           []byte
-	Keys          [][]byte
-	StartKey      []byte
-	EndKey        []byte
-	StartKeyDocID string
-	EndKeyDocID   string
-	Descending    bool
-	InclusiveEnd  bool // default true
-	Skip          int64
-	Limit         *int64
-	Reduce        *bool // nil = default (reduce when the view has one)
-	Group         bool
-	GroupLevel    *int64
-	IncludeDocs   bool
-	Conflicts     bool // With IncludeDocs, documents carry _conflicts.
-	UpdateSeq     bool
+	Key            []byte
+	Keys           [][]byte
+	StartKey       []byte
+	EndKey         []byte
+	StartKeyDocID  string
+	EndKeyDocID    string
+	Descending     bool
+	InclusiveEnd   bool // default true
+	Skip           int64
+	Limit          *int64
+	Reduce         *bool // nil = default (reduce when the view has one)
+	Group          bool
+	GroupLevel     *int64
+	IncludeDocs    bool
+	Conflicts      bool // With IncludeDocs, documents carry _conflicts.
+	AttachmentData bool // With IncludeDocs, inline attachment bodies.
+	UpdateSeq      bool
 	// ReduceLimit enables the reduce_overflow_error guard
 	// (query_server_config/reduce_limit, default true).
 	ReduceLimit bool
@@ -58,6 +59,9 @@ type ViewRow struct {
 	DocID    string          `json:"-"` // Target document for include_docs (linked documents).
 	Doc      *DocRow         `json:"-"`
 	DocError string          `json:"-"`
+	// DocAttachments holds the resolved revision's attachment metadata or
+	// bodies. It is batch-loaded with include_docs.
+	DocAttachments []Attachment `json:"-"`
 	// DocConflicts holds the doc's live non-winner leaves (conflicts=true).
 	DocConflicts []string `json:"-"`
 	// Error/ErrReason turn the row into an error row (reduce overflow).
@@ -148,7 +152,22 @@ func (s *Store) QueryView(ctx context.Context, db *DB, vg *ViewGroup, viewName s
 		result.Rows = rows
 		return result, nil
 	}
-	return s.queryViewMap(ctx, db, vg, viewName, q, result)
+	if !q.IncludeDocs {
+		return s.queryViewMap(ctx, s.pool, db, vg, viewName, q, result)
+	}
+	tx, err := s.beginReadSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	result, err = s.queryViewMap(ctx, tx, db, vg, viewName, q, result)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // viewCond builds the WHERE fragment for the query's key range. Argument
@@ -218,11 +237,11 @@ func rangeConds(q *ViewQuery) (*viewCond, error) {
 	return c, nil
 }
 
-func (s *Store) queryViewMap(ctx context.Context, db *DB, vg *ViewGroup, viewName string, q *ViewQuery, result *ViewResult) (*ViewResult, error) {
+func (s *Store) queryViewMap(ctx context.Context, qx dbBatchQueryer, db *DB, vg *ViewGroup, viewName string, q *ViewQuery, result *ViewResult) (*ViewResult, error) {
 	table := db.Schema + "." + viewTable(vg.Sig)
 
 	if q.Keys != nil {
-		return s.queryViewKeys(ctx, db, vg, viewName, q, result)
+		return s.queryViewKeys(ctx, qx, db, vg, viewName, q, result)
 	}
 
 	cond, err := rangeConds(q)
@@ -345,7 +364,7 @@ func (s *Store) queryViewMap(ctx context.Context, db *DB, vg *ViewGroup, viewNam
 		table, len(cond2.args)+4, cond2.where, dir, dir,
 		len(cond2.args)+2, len(cond2.args)+3), scanArgs...)
 
-	br := s.pool.SendBatch(ctx, batch)
+	br := qx.SendBatch(ctx, batch)
 	defer br.Close()
 	if countQueued {
 		if err := scanCounts(br.QueryRow()); err != nil {
@@ -381,7 +400,8 @@ func (s *Store) queryViewMap(ctx context.Context, db *DB, vg *ViewGroup, viewNam
 	result.TotalRows = total
 	result.Offset = before + min64(q.Skip, inRange)
 	if q.IncludeDocs {
-		if err := s.attachViewDocs(ctx, db, result.Rows, q.Conflicts); err != nil {
+		if err := s.attachViewDocs(ctx, qx, db, result.Rows,
+			q.Conflicts, q.AttachmentData); err != nil {
 			return nil, err
 		}
 	}
@@ -391,7 +411,7 @@ func (s *Store) queryViewMap(ctx context.Context, db *DB, vg *ViewGroup, viewNam
 // queryViewKeys serves ?keys=[...]. It returns rows for each requested key in request
 // order. The reported offset is the first key's position in traversal order
 // (single-shard semantics). Clustered CouchDB's value is shard-merge noise.
-func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewName string, q *ViewQuery, result *ViewResult) (*ViewResult, error) {
+func (s *Store) queryViewKeys(ctx context.Context, qx dbBatchQueryer, db *DB, vg *ViewGroup, viewName string, q *ViewQuery, result *ViewResult) (*ViewResult, error) {
 	table := db.Schema + "." + viewTable(vg.Sig)
 	// part is always constrained ('' on global views) so the scan index
 	// can bound on key_collate. It also provides partition scoping.
@@ -401,7 +421,7 @@ func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewNa
 	); hit {
 		result.TotalRows = cached
 	} else {
-		if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		if err := qx.QueryRow(ctx, fmt.Sprintf(
 			"SELECT count(*) FROM %s WHERE view_name = $1%s", table, partCond),
 			append([]any{viewName}, partArgs...)...,
 		).Scan(&result.TotalRows); err != nil {
@@ -429,7 +449,7 @@ func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewNa
 		}
 		args := append([]any{viewName}, partArgs...)
 		args = append(args, enc)
-		if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		if err := qx.QueryRow(ctx, fmt.Sprintf(
 			"SELECT count(*) FROM %s WHERE view_name = $1%s AND key_collate %s $%d",
 			table, partCond, op, len(args)),
 			args...,
@@ -475,7 +495,7 @@ func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewNa
 			keyArgs = append(keyArgs, q.EndKeyDocID)
 			docidCond += fmt.Sprintf(" AND doc_id %s $%d", op, len(keyArgs))
 		}
-		rows, err := s.pool.Query(ctx, fmt.Sprintf(
+		rows, err := qx.Query(ctx, fmt.Sprintf(
 			`SELECT key, value, doc_id FROM %s
 			 WHERE view_name = $1%s AND key_collate = $%d%s
 			 ORDER BY doc_id %s`, table, partCond, encIdx, docidCond, dir),
@@ -509,7 +529,8 @@ func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewNa
 		}
 	}
 	if q.IncludeDocs {
-		if err := s.attachViewDocs(ctx, db, result.Rows, q.Conflicts); err != nil {
+		if err := s.attachViewDocs(ctx, qx, db, result.Rows,
+			q.Conflicts, q.AttachmentData); err != nil {
 			return nil, err
 		}
 	}
@@ -519,51 +540,79 @@ func (s *Store) queryViewKeys(ctx context.Context, db *DB, vg *ViewGroup, viewNa
 // attachViewDocs resolves include_docs, including linked documents. A value
 // carrying an _id member redirects the document fetch, and a _rev member pins
 // the fetched revision. conflicts adds live non-winner leaves.
-func (s *Store) attachViewDocs(ctx context.Context, db *DB, rows []ViewRow, conflicts bool) error {
+func (s *Store) attachViewDocs(
+	ctx context.Context,
+	qx dbQueryer,
+	db *DB,
+	rows []ViewRow,
+	conflicts bool,
+	attachmentData bool,
+) error {
+	refs := make([]docRef, len(rows))
 	for i := range rows {
-		docID := rows[i].DocID
-		var pinnedRev *couch.Rev
+		ref := docRef{ID: rows[i].DocID}
 		var value map[string]any
 		if json.Unmarshal(rows[i].Value, &value) == nil {
 			if linked, ok := value["_id"].(string); ok && linked != "" {
-				docID = linked
+				ref.ID = linked
 				rows[i].DocID = linked
 			}
 			if revStr, ok := value["_rev"].(string); ok && revStr != "" {
 				if rev, err := couch.ParseRev(revStr); err == nil {
-					pinnedRev = &rev
+					ref.Rev = rev
 				}
 			}
 		}
-		var doc *DocRow
-		var err error
-		if pinnedRev != nil {
-			doc, err = s.GetDoc(ctx, db, docID, pinnedRev)
-		} else {
-			doc, err = s.GetDocAny(ctx, db, docID)
-		}
-		if err != nil {
-			if couchErr, ok := err.(*couch.Error); ok && couchErr.Status == 404 {
-				rows[i].DocError = "missing"
-				continue
-			}
-			return err
+		refs[i] = ref
+	}
+
+	docs, err := batchDocs(ctx, qx, db, refs)
+	if err != nil {
+		return err
+	}
+	resolved := make([]docRef, 0, len(rows))
+	resolvedIDs := make([]string, 0, len(rows))
+	for i, ref := range refs {
+		doc := docs[ref]
+		if doc == nil {
+			rows[i].DocError = "missing"
+			continue
 		}
 		if doc.Deleted {
 			rows[i].DocError = "deleted"
 			continue
 		}
 		rows[i].Doc = doc
-		if conflicts {
-			leaves, err := s.Leaves(ctx, db, docID)
-			if err != nil {
-				return err
+		resolved = append(resolved, docRef{ID: doc.ID, Rev: doc.Rev})
+		resolvedIDs = append(resolvedIDs, doc.ID)
+	}
+
+	if conflicts && len(resolvedIDs) > 0 {
+		leaves, err := batchLeafRevisions(ctx, qx, db, resolvedIDs)
+		if err != nil {
+			return err
+		}
+		for i := range rows {
+			doc := rows[i].Doc
+			if doc == nil {
+				continue
 			}
-			for _, leaf := range leaves {
+			for _, leaf := range leaves[doc.ID] {
 				if leaf.Rev != doc.Rev && !leaf.Deleted {
-					rows[i].DocConflicts = append(rows[i].DocConflicts, leaf.Rev.String())
+					rows[i].DocConflicts = append(
+						rows[i].DocConflicts, leaf.Rev.String())
 				}
 			}
+		}
+	}
+
+	atts, err := batchAttachments(ctx, qx, db, resolved, attachmentData)
+	if err != nil {
+		return err
+	}
+	for i := range rows {
+		if doc := rows[i].Doc; doc != nil {
+			rows[i].DocAttachments = atts[docRef{ID: doc.ID, Rev: doc.Rev}]
 		}
 	}
 	return nil

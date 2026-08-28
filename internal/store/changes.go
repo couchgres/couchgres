@@ -3,8 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
-
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -26,6 +26,9 @@ type Change struct {
 	ConflictRevs []couch.Rev
 	// Body is the winning body (populated for include_docs).
 	Body map[string]any
+	// Attachments holds the winning revision's attachment metadata or bodies
+	// when an include_docs response needs them.
+	Attachments []Attachment
 }
 
 type ChangesParams struct {
@@ -35,6 +38,10 @@ type ChangesParams struct {
 	IncludeDocs  bool
 	AllDocsStyle bool // style=all_docs reports every leaf revision.
 	Conflicts    bool // conflicts=true collects live non-winner leaves.
+	// IncludeAttachments adds attachment stubs to included docs. AttachmentData
+	// inlines their bodies for attachments=true.
+	IncludeAttachments bool
+	AttachmentData     bool
 	// DocIDs restricts the feed (filter=_doc_ids).
 	DocIDs []string
 	// DesignOnly restricts to design documents (filter=_design).
@@ -89,6 +96,30 @@ func (c *pendingCountCache) put(key pendingCountKey, value int64) {
 
 // Changes reads committed changes after Since, in seq order.
 func (s *Store) Changes(ctx context.Context, db *DB, p *ChangesParams) ([]Change, error) {
+	if !p.IncludeDocs && !p.AllDocsStyle && !p.Conflicts && !p.IncludeAttachments {
+		return s.changes(ctx, s.pool, db, p)
+	}
+	tx, err := s.beginReadSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	changes, err := s.changes(ctx, tx, db, p)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return changes, nil
+}
+
+func (s *Store) changes(
+	ctx context.Context,
+	qx dbQueryer,
+	db *DB,
+	p *ChangesParams,
+) ([]Change, error) {
 	conditions := []string{"d.seq > $1"}
 	args := []any{p.Since}
 	if len(p.DocIDs) > 0 {
@@ -115,10 +146,11 @@ func (s *Store) Changes(ctx context.Context, db *DB, p *ChangesParams) ([]Change
 		"SELECT d.seq, d.id, d.rev_num, d.rev_hash, d.deleted, %s FROM %s.docs d%s WHERE %s ORDER BY d.seq %s %s",
 		bodySel, db.Schema, join, joinAnd(conditions), order, limit)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	rows, err := qx.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var changes []Change
 	for rows.Next() {
 		var c Change
@@ -138,9 +170,17 @@ func (s *Store) Changes(ctx context.Context, db *DB, p *ChangesParams) ([]Change
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	rows.Close()
 
 	if p.AllDocsStyle || p.Conflicts {
-		if err := s.attachConflictLeaves(ctx, db, changes, p.AllDocsStyle, p.Conflicts); err != nil {
+		if err := s.attachConflictLeaves(
+			ctx, qx, db, changes, p.AllDocsStyle, p.Conflicts); err != nil {
+			return nil, err
+		}
+	}
+	if p.IncludeAttachments {
+		if err := s.attachChangeAttachments(
+			ctx, qx, db, changes, p.AttachmentData); err != nil {
 			return nil, err
 		}
 	}
@@ -150,43 +190,86 @@ func (s *Store) Changes(ctx context.Context, db *DB, p *ChangesParams) ([]Change
 // attachConflictLeaves adds non-winner leaf revisions to each change row.
 // It adds every leaf to LeafRevs for style=all_docs and live leaves to
 // ConflictRevs for conflicts=true.
-func (s *Store) attachConflictLeaves(ctx context.Context, db *DB, changes []Change, allLeaves, conflicts bool) error {
+func (s *Store) attachConflictLeaves(
+	ctx context.Context,
+	qx dbQueryer,
+	db *DB,
+	changes []Change,
+	allLeaves, conflicts bool,
+) error {
 	if len(changes) == 0 {
 		return nil
 	}
 	ids := make([]string, len(changes))
-	index := make(map[string]int, len(changes))
 	for i, c := range changes {
 		ids[i] = c.ID
-		index[c.ID] = i
 	}
-	rows, err := s.pool.Query(ctx, fmt.Sprintf(
-		`SELECT id, rev_num, rev_hash, deleted FROM %s.revs
-		 WHERE id = ANY($1) AND leaf
-		 ORDER BY id, deleted ASC, rev_num DESC, rev_hash DESC`, db.Schema), ids)
+	leavesByID, err := batchLeafRevisions(ctx, qx, db, ids)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var rev couch.Rev
-		var deleted bool
-		if err := rows.Scan(&id, &rev.Num, &rev.Hash, &deleted); err != nil {
-			return err
-		}
-		i := index[id]
-		if rev == changes[i].LeafRevs[0] {
-			continue
-		}
-		if allLeaves {
-			changes[i].LeafRevs = append(changes[i].LeafRevs, rev)
-		}
-		if conflicts && !deleted {
-			changes[i].ConflictRevs = append(changes[i].ConflictRevs, rev)
+	for i := range changes {
+		leaves := leavesByID[changes[i].ID]
+		sort.Slice(leaves, func(a, b int) bool {
+			if leaves[a].Deleted != leaves[b].Deleted {
+				return !leaves[a].Deleted
+			}
+			if leaves[a].Rev.Num != leaves[b].Rev.Num {
+				return leaves[a].Rev.Num > leaves[b].Rev.Num
+			}
+			return leaves[a].Rev.Hash > leaves[b].Rev.Hash
+		})
+		for _, leaf := range leaves {
+			if leaf.Rev == changes[i].LeafRevs[0] {
+				continue
+			}
+			if allLeaves {
+				changes[i].LeafRevs = append(changes[i].LeafRevs, leaf.Rev)
+			}
+			if conflicts && !leaf.Deleted {
+				changes[i].ConflictRevs = append(changes[i].ConflictRevs, leaf.Rev)
+			}
 		}
 	}
-	return rows.Err()
+	return nil
+}
+
+func (s *Store) attachChangeAttachments(
+	ctx context.Context,
+	qx dbQueryer,
+	db *DB,
+	changes []Change,
+	includeData bool,
+) error {
+	refs := make([]docRef, 0, len(changes))
+	for i := range changes {
+		if changes[i].Body != nil && len(changes[i].LeafRevs) > 0 {
+			refs = append(refs, docRef{ID: changes[i].ID, Rev: changes[i].LeafRevs[0]})
+		}
+	}
+	atts, err := batchAttachments(ctx, qx, db, refs, includeData)
+	if err != nil {
+		return err
+	}
+	for i := range changes {
+		if changes[i].Body != nil && len(changes[i].LeafRevs) > 0 {
+			ref := docRef{ID: changes[i].ID, Rev: changes[i].LeafRevs[0]}
+			changes[i].Attachments = atts[ref]
+		}
+	}
+	return nil
+}
+
+// AttachChangeAttachments batch-loads exact-revision attachments for changes
+// that survived an application-level filter. Unfiltered feeds load them inside
+// Changes' repeatable-read snapshot.
+func (s *Store) AttachChangeAttachments(
+	ctx context.Context,
+	db *DB,
+	changes []Change,
+	includeData bool,
+) error {
+	return s.attachChangeAttachments(ctx, s.pool, db, changes, includeData)
 }
 
 // PendingAfter counts changes past the given seq (the "pending" member).

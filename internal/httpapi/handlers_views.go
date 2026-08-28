@@ -215,6 +215,7 @@ func buildViewQuery(q url.Values, body map[string]any) (*viewRequest, error) {
 	if req.attachments, err = getBool("attachments", false); err != nil {
 		return nil, err
 	}
+	vq.AttachmentData = req.attachments
 	// Accepted with no behavioral difference. Results are always sorted
 	// and reads never touch a half-built index.
 	if _, err = getBool("sorted", true); err != nil {
@@ -519,7 +520,13 @@ func (s *Server) runView(
 				out["doc"] = nil
 			} else {
 				doc := row.Doc.JSON()
-				if err := s.addAttachmentsMember(r, db, doc, row.Doc.ID, row.Doc.Rev, req.attachments); err != nil {
+				encodingInfo, err := boolParam(
+					r.URL.Query(), "att_encoding_info", false)
+				if err != nil {
+					return nil, -1, 0, err
+				}
+				if err := addAttachmentsMemberFrom(
+					doc, row.DocAttachments, req.attachments, encodingInfo); err != nil {
 					return nil, -1, 0, err
 				}
 				if len(row.DocConflicts) > 0 {
