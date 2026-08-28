@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/couchgres/couchgres/internal/couch"
+	"github.com/jackc/pgx/v5"
 )
 
 func testStoreURL() string {
@@ -116,7 +117,7 @@ func TestReplicatorAdvisoryLockSingleton(t *testing.T) {
 	}
 }
 
-func freshDB(t *testing.T, s *Store, name string) *DB {
+func freshDB(t testing.TB, s *Store, name string) *DB {
 	t.Helper()
 	ctx := t.Context()
 	_ = s.DeleteDatabase(ctx, name)
@@ -589,8 +590,190 @@ func TestDocumentCountsRemainExactUnderConcurrentCreation(t *testing.T) {
 			t.Fatalf("concurrent create: %v", err)
 		}
 	}
-	if succeeded == 0 {
-		t.Fatal("both concurrent creates failed")
+	if succeeded != 1 {
+		t.Fatalf("concurrent creates succeeded %d times, want exactly one", succeeded)
+	}
+	assertDocumentCounts(t, s, db, 1, 0)
+}
+
+func TestConcurrentAbsentInteractiveWritesClaimOnce(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_absent_interactive_claim")
+
+	type pendingWrite struct {
+		tx        pgx.Tx
+		rev       couch.Rev
+		canonical []byte
+	}
+	pending := make([]pendingWrite, 0, 2)
+	defer func() {
+		for _, write := range pending {
+			_ = write.tx.Rollback(context.Background())
+		}
+	}()
+	for i := range 2 {
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := lockInteractiveWinner(ctx, tx, db, "same-id"); err != nil {
+			t.Fatal(err)
+		} else if found {
+			t.Fatal("winner unexpectedly existed before either create")
+		}
+		canonical := couch.CanonicalBody(map[string]any{
+			"writer": json.Number(strconv.Itoa(i)),
+		})
+		rev, err := couch.NextRev(false, nil, canonical, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending = append(pending, pendingWrite{tx: tx, rev: rev, canonical: canonical})
+	}
+
+	errs := make(chan error, len(pending))
+	for _, write := range pending {
+		go func(write pendingWrite) {
+			_, err := writeInteractiveRevision(ctx, write.tx, db, "same-id",
+				write.rev, nil, false, write.canonical, int64(len(write.canonical)),
+				s.keepSuperseded.Load(), true)
+			if err == nil {
+				err = write.tx.Commit(ctx)
+			} else {
+				_ = write.tx.Rollback(ctx)
+			}
+			errs <- err
+		}(write)
+	}
+	succeeded := 0
+	for range pending {
+		err := <-errs
+		if err == nil {
+			succeeded++
+			continue
+		}
+		if ce, ok := err.(*couch.Error); !ok || ce.Err != "conflict" {
+			t.Fatalf("concurrent absent write: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("concurrent absent writes succeeded %d times, want exactly one", succeeded)
+	}
+
+	var revCount int
+	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		"SELECT count(*) FROM %s.revs WHERE id = $1", db.Schema), "same-id",
+	).Scan(&revCount); err != nil {
+		t.Fatal(err)
+	}
+	if revCount != 1 {
+		t.Fatalf("stored revisions = %d, want 1", revCount)
+	}
+	info, err := s.DBInfo(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.UpdateSeq != 1 {
+		t.Fatalf("update sequence = %d, want 1", info.UpdateSeq)
+	}
+	assertDocumentCounts(t, s, db, 1, 0)
+}
+
+func TestConcurrentAbsentAttachmentWritesClaimOnce(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	db := freshDB(t, s, "it_absent_attachment_claim")
+
+	type pendingWrite struct {
+		tx pgx.Tx
+	}
+	pending := make([]pendingWrite, 0, 2)
+	defer func() {
+		for _, write := range pending {
+			_ = write.tx.Rollback(context.Background())
+		}
+	}()
+	for i := range 2 {
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, found, err := lockInteractiveWinner(ctx, tx, db, "same-id"); err != nil {
+			t.Fatal(err)
+		} else if found {
+			t.Fatal("winner unexpectedly existed before either create")
+		}
+		canonical := couch.CanonicalBody(map[string]any{
+			"writer": json.Number(strconv.Itoa(i)),
+		})
+		atts := []AttachmentWrite{{
+			Name: "payload.bin", ContentType: "application/octet-stream",
+			Data: []byte(strconv.Itoa(i)),
+		}}
+		revAtts, attachmentSize, err := revAttsForWrite(ctx, tx, db, "same-id", nil, atts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rev, err := couch.NextRev(false, nil, canonical, revAtts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := insertInteractiveLeaf(ctx, tx, db, "same-id", rev, nil, false,
+			canonical, int64(len(canonical))+attachmentSize,
+			s.keepSuperseded.Load()); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeAttachments(ctx, tx, db, "same-id", rev, nil, atts); err != nil {
+			t.Fatal(err)
+		}
+		pending = append(pending, pendingWrite{tx: tx})
+	}
+
+	errs := make(chan error, len(pending))
+	for _, write := range pending {
+		go func(write pendingWrite) {
+			_, err := finishInteractiveWrite(ctx, write.tx, db, "same-id", true)
+			if err == nil {
+				err = write.tx.Commit(ctx)
+			} else {
+				_ = write.tx.Rollback(ctx)
+			}
+			errs <- err
+		}(write)
+	}
+	succeeded := 0
+	for range pending {
+		err := <-errs
+		if err == nil {
+			succeeded++
+			continue
+		}
+		if ce, ok := err.(*couch.Error); !ok || ce.Err != "conflict" {
+			t.Fatalf("concurrent absent attachment write: %v", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("concurrent absent attachment writes succeeded %d times, want exactly one", succeeded)
+	}
+
+	var revCount, attachmentCount int
+	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		`SELECT (SELECT count(*) FROM %[1]s.revs WHERE id = $1),
+		        (SELECT count(*) FROM %[1]s.attachments WHERE doc_id = $1)`, db.Schema),
+		"same-id",
+	).Scan(&revCount, &attachmentCount); err != nil {
+		t.Fatal(err)
+	}
+	if revCount != 1 || attachmentCount != 1 {
+		t.Fatalf("stored revisions/attachments = %d/%d, want 1/1", revCount, attachmentCount)
+	}
+	info, err := s.DBInfo(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.UpdateSeq != 1 {
+		t.Fatalf("update sequence = %d, want 1", info.UpdateSeq)
 	}
 	assertDocumentCounts(t, s, db, 1, 0)
 }

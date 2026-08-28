@@ -103,6 +103,11 @@ func (s *Store) putDoc(
 	maxPartitionSize int64,
 ) (couch.Rev, int64, error) {
 	fail := func(err error) (couch.Rev, int64, error) { return couch.Rev{}, 0, err }
+	canonical := couch.CanonicalBody(body)
+	raw := rawBody
+	if raw == nil {
+		raw = canonical
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -110,7 +115,7 @@ func (s *Store) putDoc(
 	}
 	defer tx.Rollback(ctx)
 
-	winner, found, err := lockWinner(ctx, tx, db, id)
+	winner, found, err := lockInteractiveWinner(ctx, tx, db, id)
 	if err != nil {
 		return fail(err)
 	}
@@ -128,11 +133,6 @@ func (s *Store) putDoc(
 		return fail(couch.Conflict())
 	}
 
-	canonical := couch.CanonicalBody(body)
-	raw := rawBody
-	if raw == nil {
-		raw = canonical
-	}
 	revAtts, attachmentSize, err := revAttsForWrite(ctx, tx, db, id, parent, atts)
 	if err != nil {
 		return fail(err)
@@ -163,14 +163,19 @@ func (s *Store) putDoc(
 			}
 		}
 	}
-	if err := insertLeaf(ctx, tx, db, id, rev, parent, deleted, body, externalSize,
-		s.keepSuperseded.Load()); err != nil {
-		return fail(err)
+	var seq int64
+	if len(atts) == 0 {
+		seq, err = writeInteractiveRevision(ctx, tx, db, id, rev, parent,
+			deleted, canonical, externalSize, s.keepSuperseded.Load(), !found)
+	} else {
+		if err = insertInteractiveLeaf(ctx, tx, db, id, rev, parent,
+			deleted, canonical, externalSize, s.keepSuperseded.Load()); err == nil {
+			err = writeAttachments(ctx, tx, db, id, rev, parent, atts)
+		}
+		if err == nil {
+			seq, err = finishInteractiveWrite(ctx, tx, db, id, !found)
+		}
 	}
-	if err := writeAttachments(ctx, tx, db, id, rev, parent, atts); err != nil {
-		return fail(err)
-	}
-	seq, err := finishWrite(ctx, tx, db, id)
 	if err != nil {
 		return fail(err)
 	}
@@ -198,11 +203,10 @@ type BulkResult struct {
 }
 
 // BulkPutDocs applies a _bulk_docs batch of interactive writes in a single
-// transaction with set-based statements. The per-document PutDoc loop pays
-// about nine Postgres round trips per document, which dominates bulk ingest.
-// CouchDB returns per-document outcomes rather than using batch atomicity.
-// Conflict checks against the locked winner set preserve that behavior. A later write to
-// an id already written in the same batch sees the earlier outcome.
+// transaction with set-based statements. CouchDB returns per-document outcomes
+// rather than using batch atomicity. Conflict checks against the locked winner
+// set preserve that behavior. A later write to an id already written in the
+// same batch sees the earlier outcome.
 // bulkPrep is one write's database-free work, done in parallel before the
 // transaction opens. It contains the canonical body bytes the leaf insert needs and
 // the CouchDB-exact rev hash computed under the assumption that the
@@ -681,23 +685,63 @@ func winnerJoin(schema string) string {
 // winnerBody is the body expression to select through winnerJoin.
 const winnerBody = "coalesce(r.body, '{}'::jsonb)"
 
-// lockWinner locks the doc row (when present) and returns the current
-// winning leaf.
-func lockWinner(ctx context.Context, tx pgx.Tx, db *DB, id string) (*DocRow, bool, error) {
+// lockInteractiveWinner keeps ordinary absent-ID creates off the advisory-lock
+// manager; their final CTE atomically claims the docs primary key instead.
+// Partitioned creates retain the guarded lookup so doc locks always precede
+// partition locks when exact size limits are evaluated.
+func lockInteractiveWinner(
+	ctx context.Context,
+	tx pgx.Tx,
+	db *DB,
+	id string,
+) (*DocRow, bool, error) {
 	row := &DocRow{ID: id}
-	var raw []byte
+	if db.Partitioned {
+		return lockWinner(ctx, tx, db, id)
+	}
 	err := tx.QueryRow(ctx, fmt.Sprintf(
-		`SELECT d.rev_num, d.rev_hash, d.deleted, %s, d.seq, d.external_size
-		 FROM %s.docs d %s WHERE d.id = $1 FOR UPDATE OF d`,
-		winnerBody, db.Schema, winnerJoin(db.Schema)), id,
-	).Scan(&row.Rev.Num, &row.Rev.Hash, &row.Deleted, &raw, &row.Seq, &row.externalSize)
+		`SELECT rev_num, rev_hash, deleted, seq, external_size
+		 FROM %s.docs WHERE id = $1 FOR UPDATE`, db.Schema), id,
+	).Scan(&row.Rev.Num, &row.Rev.Hash, &row.Deleted, &row.Seq, &row.externalSize)
 	if err == pgx.ErrNoRows {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	if row.Body, err = decodeBody(raw); err != nil {
+	return row, true, nil
+}
+
+// lockWinner serializes all writers, including ones whose docs row does not
+// exist yet. Replication and purge need this guard because they do not use the
+// interactive create-only docs claim.
+func lockWinner(ctx context.Context, tx pgx.Tx, db *DB, id string) (*DocRow, bool, error) {
+	row := &DocRow{ID: id}
+	batch := &pgx.Batch{}
+	batch.Queue(
+		`SELECT pg_advisory_xact_lock(
+		   hashtextextended('doc/' || $1::text || '/' || $2::text, 0))`,
+		db.Schema, id)
+	batch.Queue(fmt.Sprintf(
+		`SELECT rev_num, rev_hash, deleted, seq, external_size
+		 FROM %s.docs WHERE id = $1 FOR UPDATE`, db.Schema), id)
+	results := tx.SendBatch(ctx, batch)
+	defer results.Close()
+	if _, err := results.Exec(); err != nil {
+		return nil, false, err
+	}
+	err := results.QueryRow().Scan(
+		&row.Rev.Num, &row.Rev.Hash, &row.Deleted, &row.Seq, &row.externalSize)
+	if err == pgx.ErrNoRows {
+		if err := results.Close(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if err := results.Close(); err != nil {
 		return nil, false, err
 	}
 	return row, true, nil
@@ -731,17 +775,61 @@ func unleafSet(keepBody bool) string {
 // parent stops being a leaf and, unless keepBody, drops its body.
 func insertLeaf(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.Rev,
 	parent *couch.Rev, deleted bool, body map[string]any, externalSize int64, keepBody bool) error {
-	if parent != nil {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(
-			`UPDATE %s.revs SET %s
-			 WHERE id = $1 AND rev_num = $2 AND rev_hash = $3`,
-			db.Schema, unleafSet(keepBody)),
-			id, parent.Num, parent.Hash,
-		); err != nil {
-			return err
-		}
+	return insertInteractiveLeaf(ctx, tx, db, id, rev, parent, deleted,
+		couch.CanonicalBody(body), externalSize, keepBody)
+}
+
+// insertInteractiveLeaf inserts a new interactive leaf and retires its parent
+// in one command. Attachment-bearing writes use this before copying attachment
+// rows; attachment-free writes use writeInteractiveRevision to fold this work
+// into winner refresh and sequence allocation too.
+func insertInteractiveLeaf(
+	ctx context.Context,
+	tx pgx.Tx,
+	db *DB,
+	id string,
+	rev couch.Rev,
+	parent *couch.Rev,
+	deleted bool,
+	canonical []byte,
+	externalSize int64,
+	keepBody bool,
+) error {
+	var inserted bool
+	var retired int64
+	err := tx.QueryRow(ctx, fmt.Sprintf(
+		`WITH inserted AS (
+		   INSERT INTO %[1]s.revs
+		     (id, rev_num, rev_hash, parent_num, parent_hash,
+		      deleted, leaf, body, external_size)
+		   VALUES ($1, $2, $3, $4, $5, $6, true, $7::jsonb, $8)
+		   ON CONFLICT (id, rev_num, rev_hash) DO NOTHING
+		   RETURNING 1
+		 ), retired AS (
+		   UPDATE %[1]s.revs r
+		   SET leaf = false,
+		       body = CASE WHEN $9::boolean THEN r.body ELSE NULL END
+		   WHERE $4::int IS NOT NULL
+		     AND r.id = $1 AND r.rev_num = $4 AND r.rev_hash = $5
+		     AND EXISTS (SELECT 1 FROM inserted)
+		   RETURNING 1
+		 )
+		 SELECT EXISTS (SELECT 1 FROM inserted),
+		        (SELECT count(*) FROM retired)`, db.Schema),
+		id, rev.Num, rev.Hash, parentNum(parent), parentHash(parent),
+		deleted, canonical, externalSize, keepBody,
+	).Scan(&inserted, &retired)
+	if err != nil {
+		return err
 	}
-	return insertLeafRev(ctx, tx, db, id, rev, parent, deleted, body, externalSize)
+	if !inserted {
+		return couch.Conflict()
+	}
+	if parent != nil && retired != 1 {
+		return fmt.Errorf("retiring parent %s for %q: updated %d rows",
+			parent.String(), id, retired)
+	}
+	return nil
 }
 
 func insertLeafRev(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.Rev,
@@ -766,58 +854,201 @@ func insertLeafRev(ctx context.Context, tx pgx.Tx, db *DB, id string, rev couch.
 	return nil
 }
 
-// finishWrite recomputes the winner, refreshes the docs cache row, bumps the
-// committed update sequence, prunes deep history, and notifies the changes broker.
-func finishWrite(ctx context.Context, tx pgx.Tx, db *DB, id string) (int64, error) {
-	var winner struct {
-		num          int
-		hash         string
-		deleted      bool
-		externalSize int64
-	}
-	// CouchDB selects winners deterministically. Live leaves beat deleted ones, then
-	// highest rev number, then lexicographically greater hash.
+// writeInteractiveRevision is the attachment-free interactive fast path. The
+// new leaf, parent retirement, deterministic winner selection, transactional
+// sequence allocation, and docs refresh execute as one dependent CTE command.
+// Winner selection explicitly excludes the retired parent and unions the
+// inserted row because PostgreSQL data-modifying CTEs share one snapshot.
+func writeInteractiveRevision(
+	ctx context.Context,
+	tx pgx.Tx,
+	db *DB,
+	id string,
+	rev couch.Rev,
+	parent *couch.Rev,
+	deleted bool,
+	canonical []byte,
+	externalSize int64,
+	keepBody bool,
+	createOnly bool,
+) (int64, error) {
+	var inserted bool
+	var retired int64
+	var allocatedSeq *int64
+	var seq *int64
+	var winnerNum *int
 	err := tx.QueryRow(ctx, fmt.Sprintf(
-		`SELECT rev_num, rev_hash, deleted,
-		        CASE WHEN deleted THEN 0 ELSE external_size END
-		 FROM %s.revs
-		 WHERE id = $1 AND leaf
-		 ORDER BY deleted ASC, rev_num DESC, rev_hash DESC LIMIT 1`, db.Schema), id,
-	).Scan(&winner.num, &winner.hash, &winner.deleted, &winner.externalSize)
-	if err != nil {
-		return 0, fmt.Errorf("recomputing winner: %w", err)
-	}
-
-	var seq int64
-	err = tx.QueryRow(ctx, fmt.Sprintf(
-		`WITH allocated AS (
+		`WITH inserted AS (
+		   INSERT INTO %[1]s.revs
+		     (id, rev_num, rev_hash, parent_num, parent_hash,
+		      deleted, leaf, body, external_size)
+		   VALUES ($1, $2, $3, $4, $5, $6, true, $7::jsonb, $8)
+		   ON CONFLICT (id, rev_num, rev_hash) DO NOTHING
+		   RETURNING rev_num, rev_hash, deleted, external_size
+		 ), retired AS (
+		   UPDATE %[1]s.revs r
+		   SET leaf = false,
+		       body = CASE WHEN $9::boolean THEN r.body ELSE NULL END
+		   WHERE $4::int IS NOT NULL
+		     AND r.id = $1 AND r.rev_num = $4 AND r.rev_hash = $5
+		     AND EXISTS (SELECT 1 FROM inserted)
+		   RETURNING 1
+		 ), winner AS MATERIALIZED (
+		   SELECT rev_num, rev_hash, deleted, external_size
+		   FROM (
+		     SELECT r.rev_num, r.rev_hash, r.deleted,
+		            CASE WHEN r.deleted THEN 0 ELSE r.external_size END AS external_size
+		     FROM %[1]s.revs r
+		     WHERE r.id = $1 AND r.leaf
+		       AND ($4::int IS NULL OR r.rev_num <> $4 OR r.rev_hash <> $5)
+		     UNION ALL
+		     SELECT i.rev_num, i.rev_hash, i.deleted,
+		            CASE WHEN i.deleted THEN 0 ELSE i.external_size END
+		     FROM inserted i
+		   ) candidates
+		   ORDER BY deleted ASC, rev_num DESC, rev_hash DESC
+		   LIMIT 1
+		 ), ready AS MATERIALIZED (
+		   SELECT w.* FROM winner w
+		   WHERE EXISTS (SELECT 1 FROM inserted)
+		     AND (SELECT count(*) FROM retired) =
+		         CASE WHEN $4::int IS NULL THEN 0 ELSE 1 END
+		 ), allocated AS (
 		   UPDATE couchgres.databases SET update_seq = update_seq + 1
-		   WHERE name = $1 RETURNING update_seq
+		   WHERE name = $10 AND EXISTS (SELECT 1 FROM ready)
+		   RETURNING update_seq
+		 ), upserted AS (
+		   INSERT INTO %[1]s.docs
+		     (id, rev_num, rev_hash, deleted, seq, external_size)
+		   SELECT $1, w.rev_num, w.rev_hash, w.deleted,
+		          a.update_seq, w.external_size
+		   FROM ready w CROSS JOIN allocated a
+		   ON CONFLICT (id) DO UPDATE SET
+		     rev_num = EXCLUDED.rev_num, rev_hash = EXCLUDED.rev_hash,
+		     deleted = EXCLUDED.deleted, seq = EXCLUDED.seq,
+		     external_size = EXCLUDED.external_size
+		   WHERE NOT $11::boolean
+		   RETURNING seq
 		 )
-		 INSERT INTO %s.docs (id, rev_num, rev_hash, deleted, seq, external_size)
-		 SELECT $2, $3, $4, $5, update_seq, $6 FROM allocated
-		 ON CONFLICT (id) DO UPDATE SET rev_num = $3, rev_hash = $4,
-		   deleted = $5, seq = EXCLUDED.seq, external_size = $6
-		 RETURNING seq`, db.Schema),
-		db.Name, id, winner.num, winner.hash, winner.deleted, winner.externalSize,
-	).Scan(&seq)
-	if err == pgx.ErrNoRows {
-		return 0, fmt.Errorf("database metadata missing for %q", db.Name)
-	}
+		 SELECT EXISTS (SELECT 1 FROM inserted),
+		        (SELECT count(*) FROM retired),
+		        (SELECT update_seq FROM allocated),
+		        (SELECT seq FROM upserted),
+		        (SELECT rev_num FROM winner)`, db.Schema),
+		id, rev.Num, rev.Hash, parentNum(parent), parentHash(parent),
+		deleted, canonical, externalSize, keepBody, db.Name, createOnly,
+	).Scan(&inserted, &retired, &allocatedSeq, &seq, &winnerNum)
 	if err != nil {
 		return 0, err
 	}
+	if !inserted {
+		return 0, couch.Conflict()
+	}
+	if parent != nil && retired != 1 {
+		return 0, fmt.Errorf("retiring parent %s for %q: updated %d rows",
+			parent.String(), id, retired)
+	}
+	if winnerNum == nil {
+		return 0, fmt.Errorf("recomputing winner: no leaf for %q", id)
+	}
+	if allocatedSeq == nil {
+		return 0, fmt.Errorf("database metadata missing for %q", db.Name)
+	}
+	if seq == nil {
+		if createOnly {
+			return 0, couch.Conflict()
+		}
+		return 0, fmt.Errorf("refreshing winner for %q: no row updated", id)
+	}
+	if err := pruneOldRevisions(ctx, tx, db, id, *winnerNum); err != nil {
+		return 0, err
+	}
+	return *seq, nil
+}
 
+// finishWrite recomputes the winner, refreshes the docs cache row, bumps the
+// committed update sequence, prunes deep history, and notifies the changes broker.
+func finishWrite(ctx context.Context, tx pgx.Tx, db *DB, id string) (int64, error) {
+	return finishInteractiveWrite(ctx, tx, db, id, false)
+}
+
+func finishInteractiveWrite(
+	ctx context.Context,
+	tx pgx.Tx,
+	db *DB,
+	id string,
+	createOnly bool,
+) (int64, error) {
+	var allocatedSeq *int64
+	var seq *int64
+	var winnerNum *int
+	err := tx.QueryRow(ctx, fmt.Sprintf(
+		`WITH winner AS MATERIALIZED (
+		   SELECT rev_num, rev_hash, deleted,
+		          CASE WHEN deleted THEN 0 ELSE external_size END AS external_size
+		   FROM %s.revs
+		   WHERE id = $1 AND leaf
+		   ORDER BY deleted ASC, rev_num DESC, rev_hash DESC LIMIT 1
+		 ), allocated AS (
+		   UPDATE couchgres.databases SET update_seq = update_seq + 1
+		   WHERE name = $2 AND EXISTS (SELECT 1 FROM winner)
+		   RETURNING update_seq
+		 ), upserted AS (
+		   INSERT INTO %s.docs
+		     (id, rev_num, rev_hash, deleted, seq, external_size)
+		   SELECT $1, w.rev_num, w.rev_hash, w.deleted,
+		          a.update_seq, w.external_size
+		   FROM winner w CROSS JOIN allocated a
+		   ON CONFLICT (id) DO UPDATE SET
+		     rev_num = EXCLUDED.rev_num, rev_hash = EXCLUDED.rev_hash,
+		     deleted = EXCLUDED.deleted, seq = EXCLUDED.seq,
+		     external_size = EXCLUDED.external_size
+		   WHERE NOT $3::boolean
+		   RETURNING seq
+		 )
+		 SELECT (SELECT update_seq FROM allocated),
+		        (SELECT seq FROM upserted),
+		        (SELECT rev_num FROM winner)`, db.Schema, db.Schema),
+		id, db.Name, createOnly,
+	).Scan(&allocatedSeq, &seq, &winnerNum)
+	if err != nil {
+		return 0, err
+	}
+	if winnerNum == nil {
+		return 0, fmt.Errorf("recomputing winner: no leaf for %q", id)
+	}
+	if allocatedSeq == nil {
+		return 0, fmt.Errorf("database metadata missing for %q", db.Name)
+	}
+	if seq == nil {
+		if createOnly {
+			return 0, couch.Conflict()
+		}
+		return 0, fmt.Errorf("refreshing winner for %q: no row updated", id)
+	}
+	if err := pruneOldRevisions(ctx, tx, db, id, *winnerNum); err != nil {
+		return 0, err
+	}
+	return *seq, nil
+}
+
+func pruneOldRevisions(
+	ctx context.Context,
+	tx pgx.Tx,
+	db *DB,
+	id string,
+	winnerNum int,
+) error {
 	// Prune ancestor path entries beyond revs_limit. Leaves always survive.
-	if pruneBelow := winner.num - db.RevsLimit; pruneBelow > 0 {
+	if pruneBelow := winnerNum - db.RevsLimit; pruneBelow > 0 {
 		if _, err := tx.Exec(ctx, fmt.Sprintf(
 			"DELETE FROM %s.revs WHERE id = $1 AND rev_num <= $2 AND NOT leaf",
 			db.Schema), id, pruneBelow,
 		); err != nil {
-			return 0, err
+			return err
 		}
 	}
-	return seq, nil
+	return nil
 }
 
 // GetDoc fetches a document, optionally at a specific revision. Any leaf is
