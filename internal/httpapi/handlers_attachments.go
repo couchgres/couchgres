@@ -77,6 +77,15 @@ func compressibleType(contentType, list string) bool {
 // Method dispatch happens here (the routes are method-less to avoid
 // ServeMux pattern conflicts with the doc fallbacks).
 
+// attachmentWriteResponse preserves CouchDB's response field order: ok, id, rev.
+// Encoding this as a map sorts id before ok, breaking our response compatibility
+// and causing clients to retry committed writes with stale revisions.
+type attachmentWriteResponse struct {
+	OK  bool   `json:"ok"`
+	ID  string `json:"id"`
+	Rev string `json:"rev"`
+}
+
 func (s *Server) attachmentDispatch(w http.ResponseWriter, r *http.Request) error {
 	return s.attachmentByMethod(w, r,
 		r.PathValue("db"), r.PathValue("docid"), r.PathValue("attname"))
@@ -310,7 +319,7 @@ func (s *Server) attachmentPutImpl(w http.ResponseWriter, r *http.Request, dbNam
 	revString := rev.String()
 	setETag(w, revString)
 	w.Header().Set("Location", s.docURL(r, dbName, docid+"/"+name))
-	writeJSON(w, 201, map[string]any{"ok": true, "id": docid, "rev": revString})
+	writeJSON(w, 201, attachmentWriteResponse{OK: true, ID: docid, Rev: revString})
 	return nil
 }
 
@@ -363,6 +372,6 @@ func (s *Server) attachmentDeleteImpl(w http.ResponseWriter, r *http.Request, db
 	}
 	revString := rev.String()
 	setETag(w, revString)
-	writeJSON(w, 200, map[string]any{"ok": true, "id": docid, "rev": revString})
+	writeJSON(w, 200, attachmentWriteResponse{OK: true, ID: docid, Rev: revString})
 	return nil
 }
