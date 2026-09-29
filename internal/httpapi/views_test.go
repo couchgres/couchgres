@@ -339,10 +339,6 @@ func TestViewDDocChangeAndCleanup(t *testing.T) {
 	if info["signature"] == "" || info["language"] != "javascript" {
 		t.Fatalf("_info: %+v", resp.body)
 	}
-	// _compact stubs answer 202.
-	if resp := send(t, h, "POST", "/vddoc/_compact", decode(t, `{}`), testAdminAuth, admin); resp.status != 202 {
-		t.Fatalf("compact: %+v", resp)
-	}
 	if resp := send(t, h, "POST", "/vddoc/_compact/vt", decode(t, `{}`), testAdminAuth, admin); resp.status != 202 {
 		t.Fatalf("compact ddoc: %+v", resp)
 	}

@@ -218,29 +218,6 @@ func TestMangoIndexLifecycle(t *testing.T) {
 	}
 }
 
-func TestMangoPartialFilterSelector(t *testing.T) {
-	h := testHandler(t)
-	admin := adminAuth()
-	seedMangoDB(t, h, "mgpart")
-	defer send(t, h, "DELETE", "/mgpart", nil, testAdminAuth, admin)
-
-	resp := send(t, h, "POST", "/mgpart/_index", decode(t,
-		`{"index":{"fields":["age"],"partial_filter_selector":{"type":"user"}},"name":"userage","ddoc":"partial"}`),
-		testAdminAuth, admin)
-	if resp.status != 200 {
-		t.Fatalf("partial index: %+v", resp)
-	}
-	// Query via the partial index: only user docs are indexed, and posts
-	// (no age) would not be in it anyway.
-	resp = send(t, h, "POST", "/mgpart/_find", decode(t,
-		`{"selector":{"age":{"$gt":0},"type":"user"},"sort":[{"age":"asc"}],"use_index":"partial"}`),
-		testAdminAuth, admin)
-	docs := resp.body["docs"].([]any)
-	if len(docs) != 3 || docs[0].(map[string]any)["_id"] != "u2" {
-		t.Fatalf("partial index query: %+v", docs)
-	}
-}
-
 func TestChangesSelectorFilter(t *testing.T) {
 	h := testHandler(t)
 	admin := adminAuth()

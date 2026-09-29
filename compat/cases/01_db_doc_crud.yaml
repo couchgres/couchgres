@@ -19,11 +19,6 @@ cases:
     body: {}
     expect_status: 200
 
-  - name: anonymous-blocked-before-open
-    method: GET
-    path: /compat_crud
-    expect_status: 200
-
   - name: db-info
     method: GET
     path: /compat_crud

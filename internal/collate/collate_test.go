@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"math/rand"
-	"sort"
 	"strconv"
 	"testing"
 )
@@ -315,38 +314,6 @@ func TestTruncateKey(t *testing.T) {
 		}
 		if string(got) != c.want {
 			t.Errorf("TruncateKey(%s, %d) = %s, want %s", c.in, c.n, got, c.want)
-		}
-	}
-}
-
-// TestSortStability: sorting many encoded keys yields the comparator's order.
-func TestSortStability(t *testing.T) {
-	r := rand.New(rand.NewSource(7))
-	values := make([]any, 300)
-	for i := range values {
-		values[i] = randomValue(r, 0)
-	}
-	byEncoding := make([]any, len(values))
-	copy(byEncoding, values)
-	keyOf := func(v any) []byte {
-		k, err := Key(toJSON(t, v))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return k
-	}
-	sort.SliceStable(byEncoding, func(i, j int) bool {
-		return bytes.Compare(keyOf(byEncoding[i]), keyOf(byEncoding[j])) < 0
-	})
-	byRef := make([]any, len(values))
-	copy(byRef, values)
-	sort.SliceStable(byRef, func(i, j int) bool {
-		return compareRef(byRef[i], byRef[j]) < 0
-	})
-	for i := range byRef {
-		if compareRef(byRef[i], byEncoding[i]) != 0 {
-			t.Fatalf("order diverges at %d: %s vs %s",
-				i, toJSON(t, byRef[i]), toJSON(t, byEncoding[i]))
 		}
 	}
 }

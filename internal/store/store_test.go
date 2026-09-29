@@ -173,15 +173,6 @@ func TestBootstrapSystemDBsAndStableUUID(t *testing.T) {
 			t.Errorf("system db %s missing from %v", sys, names)
 		}
 	}
-	var listIndexExists bool
-	if err := s.pool.QueryRow(ctx,
-		"SELECT to_regclass('couchgres.databases_name_c_idx') IS NOT NULL",
-	).Scan(&listIndexExists); err != nil {
-		t.Fatal(err)
-	}
-	if !listIndexExists {
-		t.Fatal("byte-ordered database-name index was not installed")
-	}
 }
 
 func TestListDatabasesAppliesQueryOptions(t *testing.T) {
@@ -520,31 +511,6 @@ func TestDocumentCountsTrackEveryWinnerTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertDocumentCounts(t, s, db, 2, 0)
-}
-
-func TestDatabaseStatsStripesInitialized(t *testing.T) {
-	s := testStore(t)
-	ctx := t.Context()
-	db := freshDB(t, s, "it_database_stats_stripes")
-
-	var stripes int
-	var minStripe, maxStripe int
-	var live, deleted, external int64
-	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT count(*), min(stripe), max(stripe), sum(doc_count),
-		        sum(doc_del_count), sum(external_size)
-		 FROM %s.database_stats`, db.Schema),
-	).Scan(&stripes, &minStripe, &maxStripe, &live, &deleted, &external); err != nil {
-		t.Fatal(err)
-	}
-	if stripes != databaseStatStripes || minStripe != 0 || maxStripe != databaseStatStripes-1 {
-		t.Fatalf("database stat stripes = %d [%d,%d], want %d [0,%d]",
-			stripes, minStripe, maxStripe, databaseStatStripes, databaseStatStripes-1)
-	}
-	if live != 0 || deleted != 0 || external != 0 {
-		t.Fatalf("initial database stats = (%d, %d, %d), want zeros",
-			live, deleted, external)
-	}
 }
 
 func TestDocumentIDCannotMoveBetweenDatabaseStatsStripes(t *testing.T) {

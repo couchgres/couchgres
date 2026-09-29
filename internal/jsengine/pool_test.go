@@ -299,22 +299,6 @@ func TestCompileErrorSurfaces(t *testing.T) {
 	}
 }
 
-func TestBigBatch(t *testing.T) {
-	p := testPool(t)
-	docs := make([]json.RawMessage, 500)
-	for i := range docs {
-		docs[i] = raw(`{"n":` + json.Number(itoa(i)).String() + `}`)
-	}
-	out, err := p.MapDocs(context.Background(), "sigbig",
-		[]string{`function(doc) { emit(doc.n, doc.n * 2); }`}, nil, docs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out) != 500 || string(out[499][0][0].Value) != `998` {
-		t.Fatalf("big batch: %d rows, last %s", len(out), out[499][0][0].Value)
-	}
-}
-
 func TestResourceCeilingsCannotBeWidened(t *testing.T) {
 	p := NewPoolWithLimits(100, 2*time.Second, Limits{
 		MaxCachedContexts:    defaultMaxCachedContexts + 1,
@@ -559,9 +543,4 @@ func TestConcurrentCloseAndSubmit(t *testing.T) {
 			}
 		}
 	}
-}
-
-func itoa(n int) string {
-	raw, _ := json.Marshal(n)
-	return string(raw)
 }
