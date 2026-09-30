@@ -9,21 +9,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/couchgres/couchgres/internal/buildinfo"
 	"github.com/couchgres/couchgres/internal/couch"
 	"github.com/couchgres/couchgres/internal/store"
 )
 
 func (s *Server) welcome(w http.ResponseWriter, r *http.Request) error {
+	build := buildinfo.Current()
 	writeJSON(w, 200, map[string]any{
 		"couchdb": "Welcome",
 		"version": couchDBVersion,
-		"git_sha": "couchgres",
+		"git_sha": build.GitSHA,
 		"uuid":    s.serverUUID,
 		"features": []string{
 			"access-ready", "partitioned", "pluggable-storage-engines",
 			"reshard", "scheduler",
 		},
-		"vendor": map[string]string{"name": "couchgres"},
+		"vendor": map[string]string{"name": "couchgres", "version": build.Version},
 	})
 	return nil
 }

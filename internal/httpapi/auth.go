@@ -89,7 +89,10 @@ func (s *Server) resolveUser(r *http.Request) (*couch.UserCtx, string, error) {
 
 func canIgnoreBadSessionCookie(r *http.Request) bool {
 	path := r.URL.Path
-	return path == "/_session" || path == "/_up" ||
+	// A stale browser session must not hide the public welcome metadata.
+	// Explicit credentials and require_valid_user are still enforced.
+	return (path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead)) ||
+		path == "/_session" || path == "/_up" ||
 		path == "/_utils" || strings.HasPrefix(path, "/_utils/")
 }
 

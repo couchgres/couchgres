@@ -70,14 +70,15 @@ func TestSessionLifecycle(t *testing.T) {
 	}
 	send(t, h, "DELETE", "/auth_cookie_db", nil, "Cookie", "AuthSession="+cookie)
 
-	// A tampered cookie is bad credentials, even where anonymous would be okay.
+	// A tampered cookie cannot authorize database operations, but must not
+	// hide the public welcome metadata.
 	resp = send(t, h, "PUT", "/auth_tampered", nil, "Cookie", "AuthSession=AAAA"+cookie)
 	if resp.status != 401 || resp.body["reason"] != "Authentication required." {
 		t.Fatalf("tampered cookie: %+v", resp)
 	}
 	resp = send(t, h, "GET", "/", nil, "Cookie", "AuthSession=AAAA"+cookie)
-	if resp.status != 401 || resp.body["reason"] != "Authentication required." {
-		t.Fatalf("tampered cookie on public endpoint: %+v", resp)
+	if resp.status != 200 || resp.body["couchdb"] != "Welcome" {
+		t.Fatalf("tampered cookie on welcome endpoint: %+v", resp)
 	}
 
 	record, found, err := s.lookupUser(t.Context(), "admin")
@@ -88,6 +89,10 @@ func TestSessionLifecycle(t *testing.T) {
 		s.config.cookieSecret(), record.Salt, record.Name,
 		time.Now().Unix()-s.config.sessionTimeout()-1)
 	resp = send(t, h, "GET", "/", nil, "Cookie", "AuthSession="+expired)
+	if resp.status != 200 || resp.body["couchdb"] != "Welcome" {
+		t.Fatalf("expired cookie should not block welcome: %+v", resp)
+	}
+	resp = send(t, h, "GET", "/_all_dbs", nil, "Cookie", "AuthSession="+expired)
 	if resp.status != 401 || resp.body["reason"] != "Authentication required." {
 		t.Fatalf("expired cookie: %+v", resp)
 	}
