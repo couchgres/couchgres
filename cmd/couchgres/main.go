@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/couchgres/couchgres/internal/buildinfo"
 	"github.com/couchgres/couchgres/internal/config"
 	"github.com/couchgres/couchgres/internal/couch"
 	"github.com/couchgres/couchgres/internal/httpapi"
@@ -27,6 +28,11 @@ func main() {
 }
 
 func run() error {
+	build := buildinfo.Current()
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Printf("couchgres %s (git %s)\n", build.Version, build.GitSHA)
+		return nil
+	}
 	configPath := ""
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
@@ -83,7 +89,8 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("couchgres listening", "addr", "http://"+addr)
+		slog.Info("couchgres listening", "addr", "http://"+addr,
+			"version", build.Version, "git_sha", build.GitSHA)
 		errCh <- server.Serve(listener)
 	}()
 	if cfg.Replicator.Enabled {
