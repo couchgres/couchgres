@@ -354,15 +354,6 @@ func writeRelatedPart(outer *multipart.Writer, entry openRevEntry) error {
 	return writeRelatedBody(related, entry)
 }
 
-// writeDocMultipartRelated renders a single document with attachment data as
-// a top-level multipart/related response (GET with Accept: multipart/related).
-func writeDocMultipartRelated(w http.ResponseWriter, entry openRevEntry) error {
-	writer := multipart.NewWriter(w)
-	w.Header().Set("Content-Type", "multipart/related; boundary="+writer.Boundary())
-	w.WriteHeader(200)
-	return writeRelatedBody(writer, entry)
-}
-
 func writeRelatedBody(writer *multipart.Writer, entry openRevEntry) error {
 	doc := make(map[string]any, len(entry.doc))
 	for k, v := range entry.doc {

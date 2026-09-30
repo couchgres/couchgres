@@ -317,7 +317,7 @@ func (p *Pool) ReduceGroups(ctx context.Context, sig, fn string, groups []Reduce
 	}
 	gj := make([]groupJSON, len(groups))
 	for i, g := range groups {
-		gj[i] = groupJSON{Keys: g.Keys, Values: g.Values}
+		gj[i] = groupJSON(g)
 	}
 	payload, err := json.Marshal(map[string]any{
 		"src": fn, "groups": gj, "rereduce": rereduce,

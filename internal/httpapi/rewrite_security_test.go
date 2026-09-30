@@ -116,6 +116,7 @@ func TestRewriteHeadersAreSanitizedAndCannotBeReintroduced(t *testing.T) {
 	} {
 		r.Header.Set(key, value)
 	}
+	// Deliberately insert a non-canonical header to exercise sanitization.
 	r.Header["authorization"] = []string{"Basic noncanonical-secret"}
 	clone := s.sanitizedRewriteRequest(r)
 	if got := clone.Header.Get("Content-Type"); got != "application/json" {
@@ -136,6 +137,7 @@ func TestRewriteHeadersAreSanitizedAndCannotBeReintroduced(t *testing.T) {
 			t.Errorf("rewrite was allowed to set %s", key)
 		}
 	}
+	//lint:ignore SA1008 Check the raw non-canonical key to ensure sanitization removed it.
 	if _, ok := clone.Header["authorization"]; ok {
 		t.Fatal("non-canonical authorization header survived")
 	}

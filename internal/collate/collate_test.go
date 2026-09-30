@@ -223,7 +223,7 @@ func randomValue(r *rand.Rand, depth int) any {
 		"Ärger", "ärger", "zebra", "Zürich", "abc123", "ABC 123",
 		"日本語", "русский", "emoji 😀", "café", "café", " ", "  ",
 		"tab\there", "line\nbreak", "quote\"inside", "back\\slash",
-		"control", "mixedCASE", "ümlaut", "ss", "ß",
+		"\x01control", "mixedCASE", "ümlaut", "ss", "ß",
 	}
 	numbers := []string{
 		"0", "1", "-1", "0.5", "-0.5", "3.14159", "100", "-100",

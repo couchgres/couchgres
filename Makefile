@@ -1,7 +1,8 @@
 FAUXTON_DIST := internal/fauxton/dist/index.html
 GOVULNCHECK_VERSION := v1.7.0
+STATICCHECK_VERSION := v0.8.1
 
-.PHONY: all build fauxton test vulncheck run clean-fauxton
+.PHONY: all build fauxton test staticcheck vulncheck run clean-fauxton
 
 all: build
 
@@ -16,6 +17,9 @@ build: fauxton
 
 test: fauxton
 	go test ./...
+
+staticcheck:
+	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
 
 vulncheck:
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...

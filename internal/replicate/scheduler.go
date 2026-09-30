@@ -21,7 +21,7 @@ type Scheduler struct {
 	jobs                 map[string]*Job // by replication id
 	selfBase             string          // this server's own base URL for local db names
 	cookie               func() string   // mints an admin session for loopback requests
-	allowPrivateNetworks bool            // permits explicitly configured remote LAN peers
+	allowPrivateNetworks bool            // permits remote RFC1918 and IPv6 ULA peers
 }
 
 // Job is one replication, running or finished.
@@ -50,18 +50,19 @@ func (j *Job) setState(state string, err error, result *Result) {
 	j.result = result
 }
 
-func (j *Job) State() (state string, err error, result *Result) {
+func (j *Job) State() (state string, result *Result, err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return j.state, j.err, j.result
+	return j.state, j.result, j.err
 }
 
 func NewScheduler(st *store.Store, broker *store.Broker) *Scheduler {
 	return &Scheduler{
-		store:  st,
-		broker: broker,
-		jobs:   make(map[string]*Job),
-		cookie: func() string { return "" },
+		store:                st,
+		broker:               broker,
+		jobs:                 make(map[string]*Job),
+		cookie:               func() string { return "" },
+		allowPrivateNetworks: true,
 	}
 }
 
@@ -75,9 +76,9 @@ func (s *Scheduler) SetSelf(base string, cookie func() string) {
 }
 
 // SetAllowPrivateNetworks controls whether URL-form replication endpoints may
-// resolve to loopback, private, link-local, or other special-use addresses.
-// Local database names use the separately configured self URL and remain
-// available regardless of this setting.
+// resolve to RFC1918 and IPv6 ULA addresses (allowed by default). Loopback,
+// link-local, and other special-use addresses remain blocked. Local database
+// names use the trusted self URL regardless of this setting.
 func (s *Scheduler) SetAllowPrivateNetworks(allow bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -97,7 +98,7 @@ func (s *Scheduler) resolve(endpoint string) (*Peer, error) {
 		return nil, couch.NewError(500, "unknown_error",
 			"local replication endpoints are not available before startup completes")
 	}
-	peer, err := newPeer(base+"/"+endpoint, peerConfig{allowPrivateNetworks: true})
+	peer, err := newPeer(base+"/"+endpoint, peerConfig{trustedSelf: true})
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +322,7 @@ func (s *Scheduler) reconcile(ctx context.Context) error {
 // stay "triggered" until cancelled or failed.
 func (s *Scheduler) finishDoc(ctx context.Context, db *store.DB, docID string, job *Job) {
 	job.Wait(ctx)
-	state, jobErr, _ := job.State()
+	state, _, jobErr := job.State()
 	switch state {
 	case "completed":
 		s.writeBack(ctx, db, docID, "completed", "", job.ID)

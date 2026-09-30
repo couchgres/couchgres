@@ -51,7 +51,7 @@ func (s *Server) replicateNow(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	job.Wait(r.Context())
-	state, jobErr, result := job.State()
+	state, result, jobErr := job.State()
 	switch state {
 	case "completed":
 		writeJSON(w, 200, map[string]any{
