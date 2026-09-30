@@ -35,6 +35,9 @@ jobs:
 
       - name: Install CouchDB 3.5
         run: |
+          # Remote replication permits private addresses but rejects 127/8.
+          # Keep this test peer on the runner's loopback interface.
+          sudo ip address add 10.254.0.1/32 dev lo
           curl -fsSL https://couchdb.apache.org/repo/keys.asc \
             | gpg --dearmor | sudo tee /usr/share/keyrings/couchdb-archive-keyring.gpg > /dev/null
           . /etc/os-release
@@ -43,17 +46,17 @@ jobs:
           sudo apt-get update
           sudo debconf-set-selections <<'EOF'
           couchdb couchdb/mode select standalone
-          couchdb couchdb/bindaddress string 127.0.0.1
+          couchdb couchdb/bindaddress string 10.254.0.1
           couchdb couchdb/cookie string couchgres-ci
           couchdb couchdb/adminpass password secret
           couchdb couchdb/adminpass_again password secret
           EOF
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y couchdb
           for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:5984/_up && break
+            curl -sf http://10.254.0.1:5984/_up && break
             sleep 1
           done
-          curl -sf http://127.0.0.1:5984/
+          curl -sf http://10.254.0.1:5984/
 
       - name: Fetch Fauxton
         run: make fauxton
@@ -72,7 +75,7 @@ jobs:
         # collation (509 keys sorted by internal/collate vs a real view)
         # and rev hashing (every rev a real CouchDB mints must match
         # couch.NewRevID byte for byte — there is no spec for the hash).
-        run: COUCHGRES_LIVE_COUCH=http://admin:secret@127.0.0.1:5984 go test -race ./...
+        run: COUCHGRES_LIVE_COUCH=http://admin:secret@10.254.0.1:5984 go test -race ./...
 
       - name: Start couchgres
         run: |
@@ -88,7 +91,7 @@ jobs:
             admin: secret
           log: info
           EOF
-          /tmp/couchgres /tmp/couchgres-ci.yaml &
+          /tmp/couchgres /tmp/couchgres-ci.yaml > /tmp/couchgres-ci.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:5987/_up && break
             sleep 1
@@ -98,12 +101,12 @@ jobs:
         # No credentials in COUCH_URL: anonymous cases must really be
         # anonymous; cases carry their own Authorization headers.
         run: |
-          COUCH_URL=http://127.0.0.1:5984 \
+          COUCH_URL=http://10.254.0.1:5984 \
           COUCHGRES_URL=http://127.0.0.1:5987 go run ./compat
 
       - name: Replication check against CouchDB (4 directions)
         run: |
-          COUCH=http://admin:secret@127.0.0.1:5984 \
+          COUCH=http://admin:secret@10.254.0.1:5984 \
           CG=http://admin:secret@127.0.0.1:5987 compat/replication-check.sh
 
       - name: Client compatibility (nano, PouchDB sync, couchdb-python)
@@ -114,3 +117,12 @@ jobs:
         # Catches regressions in batched Go/JS view builds: a per-doc crossing
         # would collapse docs/sec by an order of magnitude.
         run: go test ./internal/httpapi -bench BenchmarkView -benchtime 5x -run xxx
+
+      - name: Server logs on failure
+        if: failure()
+        run: |
+          if [ -f /tmp/couchgres-ci.log ]; then tail -n 200 /tmp/couchgres-ci.log; fi
+          sudo journalctl -u couchdb --no-pager -n 200
+          for log in /opt/couchdb/var/log/couchdb.log /var/log/couchdb/couchdb.log; do
+            if sudo test -f "$log"; then sudo tail -n 200 "$log"; fi
+          done

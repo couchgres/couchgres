@@ -12,7 +12,57 @@ import (
 	"net/textproto"
 	"strings"
 	"testing"
+
+	"github.com/couchgres/couchgres/internal/store"
 )
+
+func TestOpenRevsMultipartClosingBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entries []openRevEntry
+	}{
+		{name: "empty"},
+		{name: "plain", entries: []openRevEntry{{doc: map[string]any{"_id": "plain"}}}},
+		{name: "missing", entries: []openRevEntry{{missingRev: "1-missing"}}},
+		{name: "attachment", entries: []openRevEntry{{
+			doc: map[string]any{"_id": "with-att"},
+			atts: []store.Attachment{{
+				Name: "note.txt", ContentType: "text/plain", Length: 7,
+				Data: []byte("payload"),
+			}},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if err := writeOpenRevsMultipart(rec, tc.entries); err != nil {
+				t.Fatal(err)
+			}
+			mediaType, params, err := mime.ParseMediaType(rec.Header().Get("Content-Type"))
+			if err != nil || mediaType != "multipart/mixed" || params["boundary"] == "" {
+				t.Fatalf("content type: %q", rec.Header().Get("Content-Type"))
+			}
+			// CouchDB's replicator expects exactly "--" after parsing the
+			// final boundary. Go's usual trailing CRLF causes badmatch retries.
+			_, remainder, found := bytes.Cut(rec.Body.Bytes(), []byte("\r\n--"+params["boundary"]+"--"))
+			if !found || len(remainder) != 0 {
+				t.Fatalf("closing boundary missing or followed by extra bytes: %q", remainder)
+			}
+			reader := multipart.NewReader(rec.Body, params["boundary"])
+			for range tc.entries {
+				part, err := reader.NextPart()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.Copy(io.Discard, part); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := reader.NextPart(); err != io.EOF {
+				t.Fatalf("end of multipart response: %v", err)
+			}
+		})
+	}
+}
 
 func TestMultipartRelatedPut(t *testing.T) {
 	h := testHandler(t)

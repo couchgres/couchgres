@@ -335,7 +335,10 @@ func writeOpenRevsMultipart(w http.ResponseWriter, entries []openRevEntry) error
 			return nil
 		}
 	}
-	writer.Close()
+	// CouchDB's replicator requires exactly "--" after the final boundary.
+	// multipart.Writer.Close appends a CRLF that its parser returns as part
+	// of that remainder, triggering badmatch errors and replication retries.
+	fmt.Fprintf(w, "\r\n--%s--", writer.Boundary())
 	return nil
 }
 

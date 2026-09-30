@@ -2,8 +2,9 @@
 # Replicate between a real CouchDB and couchgres in four directions, then
 # compare every doc, rev, conflict, and attachment.
 #
-# Both servers need admin:secret.
-#   COUCH=http://admin:secret@127.0.0.1:5985 \
+# Both servers need admin:secret. COUCH must use a private network address
+# reachable from couchgres: remote replication rejects loopback addresses.
+#   COUCH=http://admin:secret@10.254.0.1:5985 \
 #   CG=http://admin:secret@127.0.0.1:5984 compat/replication-check.sh
 set -euo pipefail
 
@@ -46,15 +47,28 @@ def get(base, path):
         return body
 '
 
-check_replication() {
+replicate() {
+	# Capture the response before parsing it: curl -f discards HTTP error
+	# bodies, masking the replication error with a JSONDecodeError.
+	local response status
+	response=$(curl -sS --fail-with-body -X POST -H "$JSON" "$1/_replicate" -d "$2") || {
+		status=$?
+		printf 'Replication request failed (curl exit %s):\n%s\n' "$status" "$response" >&2
+		return "$status"
+	}
 	python3 -c '
 import json, sys
-r = json.load(sys.stdin)
+body = sys.stdin.read().strip()
+try:
+    r = json.loads(body)
+except json.JSONDecodeError:
+    sys.exit("Replication returned invalid JSON: " + (body or "<empty response>"))
 assert r.get("ok") is True, r
 h = r["history"][0]
 print("   wrote {} docs, {} failures".format(
     h["docs_written"], h["doc_write_failures"]))
-assert h["doc_write_failures"] == 0, r'
+assert h["doc_write_failures"] == 0, r
+assert h["docs_written"] == int(sys.argv[1]), r' "$3" <<< "$response"
 }
 
 # --- Seed the CouchDB source database -------------------------------------
@@ -95,10 +109,10 @@ EOF
 
 # --- Replicate CouchDB -> couchgres ----------------------------------------
 say "replicate couchdb -> couchgres"
-curl -sf -X POST -H "$JSON" "$COUCH/_replicate" -d '{
+replicate "$COUCH" '{
   "source": "'"$COUCH"'/repl_src",
   "target": "'"$CG"'/repl_src",
-  "create_target": true}' | check_replication
+  "create_target": true}' 4
 
 # --- Compare every doc, rev, conflict, attachment --------------------------
 say "compare repl_src (couchdb vs couchgres)"
@@ -149,10 +163,10 @@ currev=$(curl -sf "$CG/repl_back/home" | python3 -c 'import json,sys;print(json.
 curl -sf -X PUT -H 'Content-Type: text/plain' -d 'reverse attachment' "$CG/repl_back/home/note.txt?rev=$currev" > /dev/null
 
 say "replicate couchgres -> couchdb"
-curl -sf -X POST -H "$JSON" "$COUCH/_replicate" -d '{
+replicate "$COUCH" '{
   "source": "'"$CG"'/repl_back",
   "target": "'"$COUCH"'/repl_back",
-  "create_target": true}' | check_replication
+  "create_target": true}' 1
 
 say "compare repl_back (couchgres vs couchdb)"
 python3 - "$CG" "$COUCH" repl_back <<EOF
@@ -173,10 +187,10 @@ EOF
 # --- couchgres as the replicator ------------------------------------------
 say "couchgres pulls from couchdb (its own _replicate)"
 curl -sf -X DELETE "$CG/repl_pull" > /dev/null || true
-curl -sf -X POST -H "$JSON" "$CG/_replicate" -d '{
+replicate "$CG" '{
   "source": "'"$COUCH"'/repl_src",
   "target": "repl_pull",
-  "create_target": true}' | check_replication
+  "create_target": true}' 4
 
 say "compare repl_pull (couchdb vs couchgres-pulled copy)"
 python3 - "$COUCH" "$CG" <<EOF
@@ -198,10 +212,10 @@ EOF
 
 say "couchgres pushes to couchdb (its own _replicate)"
 curl -sf -X DELETE "$COUCH/repl_push" > /dev/null || true
-curl -sf -X POST -H "$JSON" "$CG/_replicate" -d '{
+replicate "$CG" '{
   "source": "repl_back",
   "target": "'"$COUCH"'/repl_push",
-  "create_target": true}' | check_replication
+  "create_target": true}' 1
 
 python3 - "$CG" "$COUCH" <<EOF
 import sys
