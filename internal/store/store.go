@@ -221,13 +221,7 @@ func (s *Store) Bootstrap(ctx context.Context) (string, error) {
 		return "", err
 	}
 	for _, schema := range schemas {
-		if _, err := s.pool.Exec(ctx, fmt.Sprintf(
-			`CREATE INDEX IF NOT EXISTS docs_design_seq_idx ON %s.docs (seq)
-			 WHERE id >= '_design/' AND id < '_design0'`, schema)); err != nil {
-			return "", fmt.Errorf("migrating %s: %w", schema, err)
-		}
-		if _, err := s.pool.Exec(ctx, fmt.Sprintf(
-			"ALTER TABLE %s.docs DROP COLUMN IF EXISTS body", schema)); err != nil {
+		if err := s.migrateDatabaseSchema(ctx, schema); err != nil {
 			return "", fmt.Errorf("migrating %s: %w", schema, err)
 		}
 		if err := s.initializeUpdateSeq(ctx, schema); err != nil {
@@ -265,6 +259,62 @@ func (s *Store) Bootstrap(ctx context.Context) (string, error) {
 		}
 	}
 	return serverUUID, nil
+}
+
+func (s *Store) migrateDatabaseSchema(ctx context.Context, schema string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Serialize schema migrations with each other and with global DDL. This
+	// avoids concurrent index creation and keeps a global ALTER TABLE from
+	// queuing ahead of writers that must finish before our schema DDL can run.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockBootstrap); err != nil {
+		return err
+	}
+
+	// The schema list may be stale. DeleteDatabase removes the registry row
+	// before dropping its schema, so a key-share lock both rechecks existence
+	// and keeps the schema alive until our DDL commits. Unlike FOR UPDATE, it
+	// lets existing document writers finish updating the registry's sequence
+	// while we wait for their table locks.
+	err = tx.QueryRow(ctx,
+		`SELECT schema_name FROM couchgres.databases
+		 WHERE schema_name = $1 FOR KEY SHARE`, schema,
+	).Scan(&schema)
+	if err == pgx.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// Even IF EXISTS/IF NOT EXISTS DDL takes table locks. Current schemas
+	// must not queue those locks ahead of another process's active requests.
+	var indexExists, bodyExists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT to_regclass($1) IS NOT NULL, EXISTS (
+		    SELECT 1 FROM pg_attribute
+		    WHERE attrelid = to_regclass($2) AND attname = 'body' AND NOT attisdropped
+		)`, schema+".docs_design_seq_idx", schema+".docs",
+	).Scan(&indexExists, &bodyExists); err != nil {
+		return err
+	}
+	if !indexExists {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			`CREATE INDEX IF NOT EXISTS docs_design_seq_idx ON %s.docs (seq)
+			 WHERE id >= '_design/' AND id < '_design0'`, schema)); err != nil {
+			return err
+		}
+	}
+	if bodyExists {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			"ALTER TABLE %s.docs DROP COLUMN IF EXISTS body", schema)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // initializeUpdateSeq migrates a database from the old nontransactional

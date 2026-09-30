@@ -185,6 +185,7 @@ Most remaining failures also fail on CouchDB outside of a full developer setup, 
 
 ```sh
 createdb couchgres_test
+createdb couchgres_httpapi_test
 make test
 make vulncheck
 
@@ -251,11 +252,17 @@ Each database maps to a PostgreSQL schema. View indexes use per signature tables
 
 ```sh
 createdb couchgres_test
+createdb couchgres_httpapi_test
 make test
 
 # View indexing throughput and reduce query latency.
 go test ./internal/httpapi -bench BenchmarkView -benchtime 10x -run xxx
 ```
+
+The store and HTTP API packages use separate PostgreSQL databases so their
+parallel tests cannot interfere with each other's schema migrations or open
+transactions. Set `COUCHGRES_TEST_PG_URL` to override the store connection and
+`COUCHGRES_HTTPAPI_TEST_PG_URL` to override the HTTP API connection.
 
 See [Verification](#verification) for checks against a live CouchDB and client libraries.
 

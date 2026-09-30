@@ -703,18 +703,27 @@ func (w *worker) call(ctx context.Context, c *workerContext, payload, fn string)
 	}
 	// Arm after re-arm so configureInterrupt cannot clear a pending cancel.
 	stop := make(chan struct{})
-	defer close(stop)
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		select {
 		case <-ctx.Done():
 			c.vm.Interrupt()
 		case <-stop:
 		}
 	}()
+	// Interrupt may still be running after stop closes. Join it before the VM
+	// can be reused or freed, including vmError's memory-limit cleanup below.
+	stopInterrupt := func() {
+		close(stop)
+		<-stopped
+	}
 	if err := ctx.Err(); err != nil {
+		stopInterrupt()
 		return "", err
 	}
 	out, err := c.vm.Call(fn, payload)
+	stopInterrupt()
 	if err != nil {
 		return "", w.vmError(ctx, c, err)
 	}

@@ -31,6 +31,7 @@ jobs:
           sudo systemctl start postgresql@18-main
           sudo -u postgres createuser --superuser "$USER"
           createdb couchgres_test
+          createdb couchgres_httpapi_test
           createdb couchgres
 
       - name: Install CouchDB 3.5

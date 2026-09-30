@@ -263,6 +263,31 @@ func TestCancelInterruptsWorker(t *testing.T) {
 	}
 }
 
+func TestCanceledCallCanCloseVM(t *testing.T) {
+	p := NewPool(1, 2*time.Second)
+	defer p.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	for range 16 {
+		if err := p.exec(t.Context(), func(w *worker) error {
+			entry, err := w.newContext("canceled-close", 1)
+			if err != nil {
+				return err
+			}
+			defer w.closeContext(entry)
+			_, err = w.call(ctx, entry, "{}", "__map")
+			if !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("canceled call: got %v, want context.Canceled", err)
+			}
+			// A failed installation closes its VM immediately. The cancellation
+			// watcher must have stopped touching it before call returns.
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // A VM older than the timeout must still run busy (but finite) scripts.
 // modernc.org/quickjs only re-arms its eval deadline in Eval, not Call. Without
 // the pool's re-arm step, this call is spuriously interrupted as

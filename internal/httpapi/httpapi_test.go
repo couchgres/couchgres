@@ -28,9 +28,11 @@ func adminAuth() string {
 }
 
 func testPostgresURL() string {
-	url := os.Getenv("COUCHGRES_TEST_PG_URL")
+	url := os.Getenv("COUCHGRES_HTTPAPI_TEST_PG_URL")
 	if url == "" {
-		url = "postgres://localhost/couchgres_test"
+		// Package tests run in parallel. Store tests hold transactions open to
+		// inspect isolation, which must not race HTTP tests' bootstrap DDL.
+		url = "postgres://localhost/couchgres_httpapi_test"
 	}
 	return url
 }
