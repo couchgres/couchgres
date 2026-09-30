@@ -17,9 +17,9 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-func TestReplicatorEnabledDefaultsTrue(t *testing.T) {
+func TestReplicatorDefaults(t *testing.T) {
 	t.Setenv("COUCHGRES_REPLICATOR_ENABLED", "")
-	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS", "")
+	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PUBLIC_NETWORKS", "")
 	cfg, err := Load(writeConfig(t, "{}\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -27,8 +27,8 @@ func TestReplicatorEnabledDefaultsTrue(t *testing.T) {
 	if !cfg.Replicator.Enabled {
 		t.Fatal("replicator.enabled defaulted to false")
 	}
-	if cfg.Replicator.AllowPrivateNetworks {
-		t.Fatal("replicator.allow_private_networks defaulted to true")
+	if cfg.Replicator.AllowPublicNetworks {
+		t.Fatal("replicator.allow_public_networks defaulted to true")
 	}
 }
 
@@ -62,30 +62,30 @@ func TestReplicatorEnabledEnvInvalid(t *testing.T) {
 	}
 }
 
-func TestReplicatorPrivateNetworksConfiguration(t *testing.T) {
+func TestReplicatorPublicNetworksConfiguration(t *testing.T) {
 	t.Setenv("COUCHGRES_REPLICATOR_ENABLED", "")
-	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS", "")
-	cfg, err := Load(writeConfig(t, "replicator:\n  allow_private_networks: true\n"))
+	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PUBLIC_NETWORKS", "")
+	cfg, err := Load(writeConfig(t, "replicator:\n  allow_public_networks: true\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Replicator.AllowPrivateNetworks {
-		t.Fatal("replicator.allow_private_networks YAML value was ignored")
+	if !cfg.Replicator.AllowPublicNetworks {
+		t.Fatal("replicator.allow_public_networks YAML value was ignored")
 	}
 
-	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS", "false")
-	cfg, err = Load(writeConfig(t, "replicator:\n  allow_private_networks: true\n"))
+	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PUBLIC_NETWORKS", "false")
+	cfg, err = Load(writeConfig(t, "replicator:\n  allow_public_networks: true\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Replicator.AllowPrivateNetworks {
-		t.Fatal("private network environment override was ignored")
+	if cfg.Replicator.AllowPublicNetworks {
+		t.Fatal("public network environment override was ignored")
 	}
 
-	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS", "sometimes")
+	t.Setenv("COUCHGRES_REPLICATOR_ALLOW_PUBLIC_NETWORKS", "sometimes")
 	if _, err := Load(writeConfig(t, "{}\n")); err == nil ||
-		!strings.Contains(err.Error(), "COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS") {
-		t.Fatalf("invalid private network environment error: %v", err)
+		!strings.Contains(err.Error(), "COUCHGRES_REPLICATOR_ALLOW_PUBLIC_NETWORKS") {
+		t.Fatalf("invalid public network environment error: %v", err)
 	}
 }
 

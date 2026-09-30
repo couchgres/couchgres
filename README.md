@@ -48,7 +48,7 @@ curl http://127.0.0.1:5984/
 | `postgres.url`                      | PostgreSQL connection URL                                                                                                                  |
 | `postgres.pool_size`                | Connection pool size                                                                                                                       |
 | `replicator.enabled`                | Starts the durable `_replicator` background worker. Defaults to `true`; set `false` for API-only instances.                                |
-| `replicator.allow_private_networks` | Allows remote URL endpoints to resolve to private or special-use addresses. Defaults to `false`; local database names remain available.    |
+| `replicator.allow_public_networks`  | Defaults to `false`. Set `true` to allow replication to public addresses.                                                                  |
 | `admins`                            | Server administrators. Plaintext passwords are PBKDF2-hashed into PostgreSQL on first start.                                               |
 | `log`                               | Log level                                                                                                                                  |
 
@@ -58,18 +58,11 @@ curl http://127.0.0.1:5984/
 | --------------------------------------------- | ------------------- | -------------------------------------------------------------------------------------------------- |
 | `COUCHGRES_ADMIN`                             | Server startup      | `name:password` pair that creates an administrator if none exists                                  |
 | `COUCHGRES_REPLICATOR_ENABLED`                | Server startup      | Boolean override for `replicator.enabled`                                                          |
-| `COUCHGRES_REPLICATOR_ALLOW_PRIVATE_NETWORKS` | Server startup      | Boolean override for `replicator.allow_private_networks`                                           |
+| `COUCHGRES_REPLICATOR_ALLOW_PUBLIC_NETWORKS`  | Server startup      | Boolean override for `replicator.allow_public_networks`                                            |
 | `COUCHGRES_HTTP_*`                            | Server startup      | Overrides the corresponding `http` timeout or `max_header_bytes` listener setting                  |
 | `COUCHGRES_LIVE_COUCH`                        | Tests               | CouchDB URL (with credentials) for live collation and rev hash tests                               |
 | `COUCHGRES_URL`                               | Compatibility tools | couchgres base URL for `compat/` and `compat/clients/`                                             |
 | `COUCH_URL`                                   | Compatibility tools | CouchDB base URL for side by side checks. Leave credentials out so anonymous cases stay anonymous. |
-
-Outbound replication accepts only HTTP and HTTPS endpoints. URL-form peers
-must resolve exclusively to public addresses unless
-`replicator.allow_private_networks` is enabled; local database names always use
-the trusted loopback endpoint. Redirects are revalidated, environment HTTP
-proxies are not used, and peer responses and multipart attachment parts have a
-64 MiB in-memory ceiling.
 
 ### Runtime settings (Config API)
 
@@ -166,6 +159,7 @@ Most remaining failures also fail on CouchDB outside of a full developer setup, 
 - By default, couchgres removes a superseded revision body when a newer revision is written. This is equivalent to immediate CouchDB compaction. Set `couchgres/keep_superseded_bodies` to `true` to keep superseded bodies and bodies of deleted revisions readable through `?rev=` until `_compact` runs.
 - Attachment data for old revisions remains until `_compact`. Compaction removes attachment rows that are no longer referenced by a live revision and trims revision histories to `_revs_limit`.
 - PostgreSQL manages physical file reclamation, so tools that expect `sizes.file` to shrink immediately after compaction will not see that behavior.
+- Replication URLs cannot use loopback or link-local addresses. For databases on this instance, use their names: `{"source":"orders","target":"orders_backup"}`.
 - When multiple Couchgres processes use the same PostgreSQL database, only one process runs the durable `_replicator` worker at a time. PostgreSQL advisory locks coordinate which process owns it. Processes with `replicator.enabled: false` still serve the HTTP API and accept `POST /_replicate` requests, but they do not run `_replicator` documents.
 - Runtime configuration and database registry caches stay in sync across processes through PostgreSQL notifications and durable metadata versions.
 - Temporary continuous `POST /_replicate` jobs, `_active_tasks`, and live `_scheduler/jobs` entries exist only in the process that created them. For replication that must survive process restarts or work across multiple processes, use `_replicator` documents.

@@ -18,13 +18,13 @@ const (
 )
 
 var (
-	// ErrPrivateNetwork reports a remote endpoint that resolves to an address
+	// ErrBlockedAddress reports a remote endpoint that resolves to an address
 	// Couchgres does not permit replication to reach.
-	ErrPrivateNetwork = errors.New("replication endpoint resolves to a private or special-use address")
+	ErrBlockedAddress = errors.New("replication endpoint resolves to a blocked address")
 
 	// Prefixes which netip considers global unicast but which are not suitable
-	// remote replication destinations. Method-based checks below cover private,
-	// loopback, link-local, multicast, and unspecified ranges.
+	// remote replication destinations. Method-based checks below cover loopback,
+	// link-local, multicast, and unspecified ranges.
 	specialUsePrefixes = []netip.Prefix{
 		netip.MustParsePrefix("0.0.0.0/8"),      // this network
 		netip.MustParsePrefix("100.64.0.0/10"),  // shared address space
@@ -47,9 +47,10 @@ var (
 )
 
 type peerConfig struct {
-	allowPrivateNetworks bool
-	maxResponseBytes     int64
-	maxAttachmentBytes   int64
+	allowPublicNetworks bool
+	trustedSelf         bool // only for local database names using the server's self URL
+	maxResponseBytes    int64
+	maxAttachmentBytes  int64
 }
 
 func (c peerConfig) withDefaults() peerConfig {
@@ -62,7 +63,7 @@ func (c peerConfig) withDefaults() peerConfig {
 	return c
 }
 
-func validatePeerURL(u *url.URL, allowPrivateNetworks bool) error {
+func validatePeerURL(u *url.URL, cfg peerConfig) error {
 	if u == nil || u.Opaque != "" || u.Host == "" || u.Hostname() == "" {
 		return errors.New("endpoint must be an absolute URL")
 	}
@@ -80,18 +81,18 @@ func validatePeerURL(u *url.URL, allowPrivateNetworks bool) error {
 	if u.User != nil {
 		return errors.New("redirect endpoint must not contain credentials")
 	}
-	if allowPrivateNetworks {
+	if cfg.trustedSelf {
 		return nil
 	}
-	if addr, err := netip.ParseAddr(u.Hostname()); err == nil && blockedAddress(addr) {
-		return ErrPrivateNetwork
+	if addr, err := netip.ParseAddr(u.Hostname()); err == nil && blockedAddress(addr, cfg.allowPublicNetworks) {
+		return ErrBlockedAddress
 	}
 	return nil
 }
 
-func blockedAddress(addr netip.Addr) bool {
+func blockedAddress(addr netip.Addr, allowPublicNetworks bool) bool {
 	addr = addr.Unmap()
-	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsPrivate() ||
+	if !addr.IsValid() || !addr.IsGlobalUnicast() ||
 		addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
 		addr.IsMulticast() || addr.IsUnspecified() {
 		return true
@@ -101,7 +102,7 @@ func blockedAddress(addr netip.Addr) bool {
 			return true
 		}
 	}
-	return false
+	return !addr.IsPrivate() && !allowPublicNetworks
 }
 
 func newPeerHTTPClient(cfg peerConfig) *http.Client {
@@ -110,13 +111,14 @@ func newPeerHTTPClient(cfg peerConfig) *http.Client {
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		},
-		resolver:             net.DefaultResolver,
-		allowPrivateNetworks: cfg.allowPrivateNetworks,
+		resolver:            net.DefaultResolver,
+		allowPublicNetworks: cfg.allowPublicNetworks,
+		trustedSelf:         cfg.trustedSelf,
 	}
 	transport := &http.Transport{
 		// Deliberately do not use ProxyFromEnvironment. An HTTP proxy would make
 		// the proxy, rather than the validated peer, the dial target and could
-		// therefore bypass the private-network policy.
+		// therefore bypass the destination policy.
 		DialContext:            dialer.DialContext,
 		ForceAttemptHTTP2:      true,
 		MaxIdleConns:           16,
@@ -131,18 +133,19 @@ func newPeerHTTPClient(cfg peerConfig) *http.Client {
 	return &http.Client{
 		Transport:     transport,
 		Timeout:       5 * time.Minute,
-		CheckRedirect: checkPeerRedirect(cfg.allowPrivateNetworks),
+		CheckRedirect: checkPeerRedirect(cfg),
 	}
 }
 
 type peerDialer struct {
-	dialer               net.Dialer
-	resolver             *net.Resolver
-	allowPrivateNetworks bool
+	dialer              net.Dialer
+	resolver            *net.Resolver
+	allowPublicNetworks bool
+	trustedSelf         bool
 }
 
 func (d *peerDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	if d.allowPrivateNetworks {
+	if d.trustedSelf {
 		return d.dialer.DialContext(ctx, network, address)
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, d.dialer.Timeout)
@@ -152,8 +155,8 @@ func (d *peerDialer) DialContext(ctx context.Context, network, address string) (
 		return nil, fmt.Errorf("invalid replication address: %w", err)
 	}
 	if addr, err := netip.ParseAddr(host); err == nil {
-		if blockedAddress(addr) {
-			return nil, fmt.Errorf("%w: %s", ErrPrivateNetwork, host)
+		if blockedAddress(addr, d.allowPublicNetworks) {
+			return nil, fmt.Errorf("%w: %s", ErrBlockedAddress, host)
 		}
 		return d.dialer.DialContext(dialCtx, network, address)
 	}
@@ -166,8 +169,8 @@ func (d *peerDialer) DialContext(ctx context.Context, network, address string) (
 		return nil, fmt.Errorf("resolving replication endpoint %s: no addresses", host)
 	}
 	for _, addr := range addrs {
-		if blockedAddress(addr) {
-			return nil, fmt.Errorf("%w: %s", ErrPrivateNetwork, host)
+		if blockedAddress(addr, d.allowPublicNetworks) {
+			return nil, fmt.Errorf("%w: %s", ErrBlockedAddress, host)
 		}
 	}
 
@@ -189,7 +192,7 @@ func (d *peerDialer) DialContext(ctx context.Context, network, address string) (
 	return nil, fmt.Errorf("dialing replication endpoint %s: %w", host, errors.Join(dialErrors...))
 }
 
-func checkPeerRedirect(allowPrivateNetworks bool) func(*http.Request, []*http.Request) error {
+func checkPeerRedirect(cfg peerConfig) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("stopped after 10 redirects")
@@ -210,7 +213,12 @@ func checkPeerRedirect(allowPrivateNetworks bool) func(*http.Request, []*http.Re
 			req.URL.Fragment = ""
 			return errors.New("unsafe replication redirect: fragments are not allowed")
 		}
-		if err := validatePeerURL(req.URL, allowPrivateNetworks); err != nil {
+		// A local peer's address-policy exception must not follow a redirect
+		// away from the server's configured self endpoint.
+		if cfg.trustedSelf && !sameOrigin(via[0].URL, req.URL) {
+			return errors.New("unsafe replication redirect: local endpoint changed origin")
+		}
+		if err := validatePeerURL(req.URL, cfg); err != nil {
 			return fmt.Errorf("unsafe replication redirect: %w", err)
 		}
 		previous := via[len(via)-1].URL

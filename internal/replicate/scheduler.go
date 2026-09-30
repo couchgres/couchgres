@@ -17,11 +17,11 @@ type Scheduler struct {
 	store  *store.Store
 	broker *store.Broker
 
-	mu                   sync.Mutex
-	jobs                 map[string]*Job // by replication id
-	selfBase             string          // this server's own base URL for local db names
-	cookie               func() string   // mints an admin session for loopback requests
-	allowPrivateNetworks bool            // permits remote RFC1918 and IPv6 ULA peers
+	mu                  sync.Mutex
+	jobs                map[string]*Job // by replication id
+	selfBase            string          // this server's own base URL for local db names
+	cookie              func() string   // mints an admin session for loopback requests
+	allowPublicNetworks bool            // permits public peers in addition to private peers
 }
 
 // Job is one replication, running or finished.
@@ -58,11 +58,10 @@ func (j *Job) State() (state string, result *Result, err error) {
 
 func NewScheduler(st *store.Store, broker *store.Broker) *Scheduler {
 	return &Scheduler{
-		store:                st,
-		broker:               broker,
-		jobs:                 make(map[string]*Job),
-		cookie:               func() string { return "" },
-		allowPrivateNetworks: true,
+		store:  st,
+		broker: broker,
+		jobs:   make(map[string]*Job),
+		cookie: func() string { return "" },
 	}
 }
 
@@ -75,24 +74,23 @@ func (s *Scheduler) SetSelf(base string, cookie func() string) {
 	s.cookie = cookie
 }
 
-// SetAllowPrivateNetworks controls whether URL-form replication endpoints may
-// resolve to RFC1918 and IPv6 ULA addresses (allowed by default). Loopback,
-// link-local, and other special-use addresses remain blocked. Local database
-// names use the trusted self URL regardless of this setting.
-func (s *Scheduler) SetAllowPrivateNetworks(allow bool) {
+// SetAllowPublicNetworks controls whether URL-form replication endpoints may
+// resolve to public addresses. Private peers are always allowed; loopback,
+// link-local, and other special-use addresses remain blocked.
+func (s *Scheduler) SetAllowPublicNetworks(allow bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.allowPrivateNetworks = allow
+	s.allowPublicNetworks = allow
 }
 
 // resolve turns a replication endpoint (URL or local db name) into a Peer.
 func (s *Scheduler) resolve(endpoint string) (*Peer, error) {
 	s.mu.Lock()
 	base, cookie := s.selfBase, s.cookie
-	allowPrivateNetworks := s.allowPrivateNetworks
+	allowPublicNetworks := s.allowPublicNetworks
 	s.mu.Unlock()
 	if strings.Contains(endpoint, "://") {
-		return newPeer(endpoint, peerConfig{allowPrivateNetworks: allowPrivateNetworks})
+		return newPeer(endpoint, peerConfig{allowPublicNetworks: allowPublicNetworks})
 	}
 	if base == "" {
 		return nil, couch.NewError(500, "unknown_error",

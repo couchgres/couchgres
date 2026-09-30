@@ -26,13 +26,25 @@ func TestNewPeerValidatesEndpointAndStripsCredentials(t *testing.T) {
 		t.Fatal("URL credentials were not converted to an authorization header")
 	}
 
+	for _, endpoint := range []string{
+		"http://10.0.0.1/db", "http://172.16.0.1/db", "http://192.168.0.1/db",
+		"http://[fd00::1]/db", "http://[::ffff:10.0.0.1]/db",
+	} {
+		if _, err := NewPeer(endpoint); err != nil {
+			t.Errorf("private peer %q: %v", endpoint, err)
+		}
+	}
+
 	invalid := []string{
 		"ftp://example.com/db",
 		"file:///tmp/db",
 		"http://127.0.0.1/db",
+		"http://169.254.169.254/db",
 		"http://0.0.0.1/db",
 		"http://100.64.0.1/db",
 		"http://[::1]/db",
+		"http://[::ffff:127.0.0.1]/db",
+		"http://[fe80::1]/db",
 		"http://[fec0::1]/db",
 		"http://192.0.2.1/db",
 		"https://example.com/db#fragment",
@@ -50,19 +62,19 @@ func TestNewPeerValidatesEndpointAndStripsCredentials(t *testing.T) {
 	}
 }
 
-func TestPeerBlocksPrivateDNSAtDialTime(t *testing.T) {
-	peer, err := NewPeer("http://localhost:1/db")
+func TestPeerBlocksLoopbackDNSAtDialTime(t *testing.T) {
+	peer, err := newPeer("http://localhost:1/db", peerConfig{allowPublicNetworks: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = peer.Exists(context.Background())
-	if !errors.Is(err, ErrPrivateNetwork) {
-		t.Fatalf("localhost request: want ErrPrivateNetwork, got %v", err)
+	if !errors.Is(err, ErrBlockedAddress) {
+		t.Fatalf("localhost request: want ErrBlockedAddress, got %v", err)
 	}
 }
 
-func TestPeerPrivateNetworkOptInAndTransportLimits(t *testing.T) {
-	peer, err := newPeer("http://127.0.0.1:5984/db", peerConfig{allowPrivateNetworks: true})
+func TestPeerTransportLimits(t *testing.T) {
+	peer, err := NewPeer("http://10.0.0.1:5984/db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,12 +94,22 @@ func TestPeerPrivateNetworkOptInAndTransportLimits(t *testing.T) {
 }
 
 func TestPeerRedirectPolicy(t *testing.T) {
-	check := checkPeerRedirect(false)
+	check := checkPeerRedirect(peerConfig{allowPublicNetworks: true})
 	previous := &http.Request{URL: mustURL(t, "https://example.com/db")}
 
-	private := &http.Request{URL: mustURL(t, "https://127.0.0.1/db"), Header: make(http.Header)}
-	if err := check(private, []*http.Request{previous}); !errors.Is(err, ErrPrivateNetwork) {
-		t.Fatalf("private redirect: %v", err)
+	public := &http.Request{URL: mustURL(t, "https://8.8.8.8/db"), Header: make(http.Header)}
+	if err := checkPeerRedirect(peerConfig{})(public, []*http.Request{previous}); !errors.Is(err, ErrBlockedAddress) {
+		t.Fatalf("public redirect without opt-in: %v", err)
+	}
+	if err := check(public, []*http.Request{previous}); err != nil {
+		t.Fatalf("public redirect with opt-in: %v", err)
+	}
+
+	for _, endpoint := range []string{"https://127.0.0.1/db", "https://169.254.169.254/db"} {
+		blocked := &http.Request{URL: mustURL(t, endpoint), Header: make(http.Header)}
+		if err := check(blocked, []*http.Request{previous}); !errors.Is(err, ErrBlockedAddress) {
+			t.Fatalf("special-use redirect %q: %v", endpoint, err)
+		}
 	}
 
 	downgrade := &http.Request{URL: mustURL(t, "http://example.com/db"), Header: make(http.Header)}
@@ -97,7 +119,7 @@ func TestPeerRedirectPolicy(t *testing.T) {
 	}
 
 	crossOrigin := &http.Request{
-		URL: mustURL(t, "https://other.example/db"),
+		URL: mustURL(t, "https://10.0.0.1/db"),
 		Header: http.Header{
 			"Authorization":       {"Basic secret"},
 			"Cookie":              {"AuthSession=secret"},
@@ -122,6 +144,17 @@ func TestPeerRedirectPolicy(t *testing.T) {
 	}
 	if strings.Contains(credentialURL.URL.String(), "redirect-secret") {
 		t.Fatalf("rejected redirect retained credentials: %s", credentialURL.URL)
+	}
+
+	selfCheck := checkPeerRedirect(peerConfig{trustedSelf: true})
+	self := &http.Request{URL: mustURL(t, "http://127.0.0.1:5984/db")}
+	redirect := &http.Request{URL: mustURL(t, "http://127.0.0.1:5984/db/")}
+	if err := selfCheck(redirect, []*http.Request{self}); err != nil {
+		t.Fatalf("same-origin local redirect: %v", err)
+	}
+	redirect.URL = mustURL(t, "http://127.0.0.1:8000/db")
+	if err := selfCheck(redirect, []*http.Request{self}); err == nil {
+		t.Fatal("local redirect escaped the trusted self origin")
 	}
 }
 

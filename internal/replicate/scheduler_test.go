@@ -2,6 +2,8 @@ package replicate
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -61,9 +63,19 @@ func TestSchedulerPruneDoesNotClobberReplacement(t *testing.T) {
 	}
 }
 
-func TestSchedulerPrivateNetworkPolicyKeepsLocalNames(t *testing.T) {
+func TestSchedulerPublicNetworkOptInKeepsLocalNames(t *testing.T) {
 	s := NewScheduler(nil, nil)
-	s.SetSelf("http://127.0.0.1:5984", func() string { return "cookie" })
+	self := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	}))
+	defer self.Close()
+	s.SetSelf(self.URL, func() string { return "cookie" })
+	if _, err := s.resolve("http://10.0.0.1:5984/remote_db"); err != nil {
+		t.Fatalf("private peer should be allowed by default: %v", err)
+	}
+	if _, err := s.resolve(self.URL + "/remote_db"); err == nil {
+		t.Fatal("URL-form loopback endpoint was allowed")
+	}
 
 	local, err := s.resolve("local_db")
 	if err != nil {
@@ -72,12 +84,21 @@ func TestSchedulerPrivateNetworkPolicyKeepsLocalNames(t *testing.T) {
 	if local.cookie != "cookie" {
 		t.Fatal("local database did not receive the self-authentication cookie")
 	}
-	if _, err := s.resolve("http://127.0.0.1:5984/remote_db"); err == nil {
-		t.Fatal("URL-form private endpoint was allowed by default")
+	if exists, err := local.Exists(t.Context()); err != nil || !exists {
+		t.Fatalf("local database request: exists=%t err=%v", exists, err)
 	}
 
-	s.SetAllowPrivateNetworks(true)
-	if _, err := s.resolve("http://127.0.0.1:5984/remote_db"); err != nil {
-		t.Fatalf("private endpoint opt-in: %v", err)
+	for _, endpoint := range []string{"http://8.8.8.8/db", "http://[2606:4700:4700::1111]/db"} {
+		s.SetAllowPublicNetworks(false)
+		if _, err := s.resolve(endpoint); err == nil {
+			t.Fatalf("public peer %q was allowed without opt-in", endpoint)
+		}
+		s.SetAllowPublicNetworks(true)
+		if _, err := s.resolve(endpoint); err != nil {
+			t.Fatalf("public peer %q with opt-in: %v", endpoint, err)
+		}
+	}
+	if _, err := s.resolve(self.URL + "/remote_db"); err == nil {
+		t.Fatal("public network opt-in allowed a loopback endpoint")
 	}
 }

@@ -31,6 +31,7 @@ type Peer struct {
 
 // NewPeer parses a database URL. Credentials in the URL become a Basic
 // Authorization header (and are never reported back to clients).
+// Only private LAN/VPC addresses are allowed by default.
 func NewPeer(rawURL string) (*Peer, error) {
 	return newPeer(rawURL, peerConfig{})
 }
@@ -53,7 +54,7 @@ func newPeer(rawURL string, cfg peerConfig) (*Peer, error) {
 		peer.auth = "Basic " + base64.StdEncoding.EncodeToString([]byte(cred))
 		parsed.User = nil
 	}
-	if err := validatePeerURL(parsed, cfg.allowPrivateNetworks); err != nil {
+	if err := validatePeerURL(parsed, cfg); err != nil {
 		return nil, couch.BadRequest("Invalid replication endpoint: " + err.Error())
 	}
 	peer.base = strings.TrimRight(parsed.String(), "/")

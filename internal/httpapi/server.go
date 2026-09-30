@@ -85,11 +85,11 @@ func (s *Server) SetSelfURL(base string) {
 	s.scheduler.SetSelf(base, s.mintAdminCookie)
 }
 
-// SetReplicatorAllowPrivateNetworks permits URL-form replication endpoints to
-// reach private network addresses. Local database names always use the trusted
-// self URL and do not require this opt-in.
-func (s *Server) SetReplicatorAllowPrivateNetworks(allow bool) {
-	s.scheduler.SetAllowPrivateNetworks(allow)
+// SetReplicatorAllowPublicNetworks permits URL-form replication endpoints to
+// reach public addresses. Private peers are always allowed;
+// local database names always use the trusted self URL.
+func (s *Server) SetReplicatorAllowPublicNetworks(allow bool) {
+	s.scheduler.SetAllowPublicNetworks(allow)
 }
 
 // SetStreamWriteTimeout keeps active streaming responses on a rolling write
